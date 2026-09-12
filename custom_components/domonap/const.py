@@ -52,11 +52,13 @@ PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.CAMERA, Platform.BINARY_S
 
 RESET_DELAY = 10 # секунды
 
-# Legacy phone/SMS SignalR transport. Keep unchanged for compatibility.
+# Phone/SMS SignalR transport. The current app (v9851) connects with
+# shouldSkipNegotiate(true): a direct WebSocket to the hub, no negotiate and
+# no connectionToken query parameter.
 WS_MESSAGE_END = "\x1e"
 WS_HANDSHAKE_MESSAGE = '{"protocol":"json","version":1}' + WS_MESSAGE_END
 WS_PING_MESSAGE = '{"type":6}' + WS_MESSAGE_END
-WS_URL = "wss://api.domonap.ru/notificationHub/?id="
+WS_URL = "wss://api.domonap.ru/notificationHub"
 
 # Rubetek/AOSP panel transport recovered from the APK: direct WebSocket,
 # shouldSkipNegotiate(true), no connectionToken query parameter.

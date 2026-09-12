@@ -206,7 +206,7 @@ class IntercomAPI:
             self._session._default_headers.update(self.headers)
 
     def signalr_headers(self) -> Dict[str, str]:
-        """Заголовки для SignalR (negotiate + WebSocket-апгрейд).
+        """Заголовки для SignalR (WebSocket-апгрейд хаба).
 
         В приложении hub использует отдельный OkHttp-клиент, который в DI-колбэке
         (`provideSignalR`) получает только DeviceCoreServicesRepository, поэтому
@@ -879,18 +879,3 @@ class IntercomAPI:
             return res
         _LOGGER.debug("end_call_notify(%s) -> %s", call_id, res)
         return {"ok": True, "body": res}
-
-    async def get_notify_id_token(self) -> Optional[dict]:
-        res = await self._post(
-            "/notificationHub/negotiate?negotiateVersion=1",
-            need_auth=True,
-            expect="json",
-            header_set=self.signalr_headers(),
-        )
-        if isinstance(res, dict) and "error" in res and "status" in res:
-            _LOGGER.debug("negotiate failed: %s", res)
-            return None
-        return {
-            "connectionId": res.get("connectionId"),
-            "connectionToken": res.get("connectionToken"),
-        }
