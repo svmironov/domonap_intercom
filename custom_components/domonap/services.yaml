@@ -49,3 +49,25 @@ open_relay_by_last_call_door_id:
       required: false
       selector:
         text:
+
+silence_active_call:
+  name: Silence active call
+  description: Answers the active intercom call (SIP 200 OK) and immediately ends it, so the intercom panel stops ringing. No media flows through Home Assistant. If an external SIP leg is established, it is ended as well.
+  fields:
+    config_entry_id:
+      name: Config entry id
+      description: Optional. Use when you have multiple Domonap accounts configured.
+      required: false
+      selector:
+        text:
+
+reject_active_call:
+  name: Reject active call
+  description: Ends the active call without answering it (SIP 603 Decline while still ringing). The intercom panel may keep ringing for other residents until someone answers or it times out.
+  fields:
+    config_entry_id:
+      name: Config entry id
+      description: Optional. Use when you have multiple Domonap accounts configured.
+      required: false
+      selector:
+        text:

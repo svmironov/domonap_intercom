@@ -5,6 +5,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "custom_components" / "domonap"
@@ -41,6 +42,8 @@ panel_call_controller = load_module(
 panel_runtime_consumer = load_module(
     "custom_components.domonap.panel_runtime_consumer", "panel_runtime_consumer.py"
 )
+load_module("custom_components.domonap.util", "util.py")
+actions = load_module("custom_components.domonap.actions", "actions.py")
 
 RubetekPanelIntercomAPI = panel_api.RubetekPanelIntercomAPI
 PanelCallController = panel_call_controller.PanelCallController
@@ -55,9 +58,22 @@ class FakeBus:
         self.events.append((event_type, data))
 
 
+class FakeServiceRegistry:
+    def __init__(self) -> None:
+        self.registered = {}
+
+    def async_register(self, domain, service, handler, schema=None, supports_response=False):
+        self.registered[(domain, service)] = handler
+
+    def async_remove(self, domain, service):
+        self.registered.pop((domain, service), None)
+
+
 class FakeHass:
     def __init__(self) -> None:
         self.bus = FakeBus()
+        self.services = FakeServiceRegistry()
+        self.data = {}
 
 
 class FakeController:
@@ -295,6 +311,128 @@ class PanelCallTimerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.6)
 
         self.assertEqual(ended, [])
+
+
+class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
+    def _setup_runtime(self, hass, api, controller):
+        hass.data["domonap"] = {
+            "entry-1": {
+                "api": api,
+                "call_controller": controller,
+            }
+        }
+
+    async def test_silence_answers_then_ends_without_opening_the_door(self):
+        """silence_active_call: answer (200 OK) -> end, no relay involved."""
+        hass = FakeHass()
+        await actions.async_setup_actions(hass)
+        handler = hass.services.registered[("domonap", "silence_active_call")]
+
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-123")
+        events = []
+
+        class FakePanelSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True, "method": "sip_answer"}
+
+        api._active_sip_call = FakePanelSipCall()
+
+        async def fake_end_active_call():
+            events.append("end")
+            return {"ok": True}
+
+        api.end_active_call = fake_end_active_call
+        controller = PanelCallController(
+            hass, api, config_entry_id="entry-1", enabled=False
+        )
+        self._setup_runtime(hass, api, controller)
+
+        original = panel_api.RubetekPanelSipCall
+        panel_api.RubetekPanelSipCall = FakePanelSipCall
+        try:
+            result = await handler(SimpleNamespace(data={}))
+        finally:
+            panel_api.RubetekPanelSipCall = original
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["answered"])
+        # Answer must happen before the teardown, so the 200 OK mutes the
+        # panel even for this door-less path.
+        self.assertEqual(events, ["answer", "end"])
+
+    async def test_silence_skips_answer_when_external_leg_established(self):
+        hass = FakeHass()
+        await actions.async_setup_actions(hass)
+        handler = hass.services.registered[("domonap", "silence_active_call")]
+
+        class EstablishedController:
+            external_call_established = True
+
+            async def end_call(self, *, source):
+                return {"ok": True, "source": source}
+
+        controller = EstablishedController()
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-123")
+
+        async def fail_answer(self, timeout=2.0, **kwargs):
+            raise AssertionError("Panel leg is already answered; must not re-answer")
+
+        api._answer_active_sip_before_open = fail_answer
+        self._setup_runtime(hass, api, controller)
+
+        result = await handler(SimpleNamespace(data={}))
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["answered"])
+
+    async def test_reject_ends_without_answering(self):
+        """reject_active_call: no 200 OK, straight to teardown (603 path)."""
+        hass = FakeHass()
+        await actions.async_setup_actions(hass)
+        handler = hass.services.registered[("domonap", "reject_active_call")]
+
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-123")
+        events = []
+
+        async def fake_end_active_call():
+            events.append("end")
+            return {"ok": True}
+
+        api.end_active_call = fake_end_active_call
+
+        async def fail_answer():
+            raise AssertionError("reject must not answer the SIP leg")
+
+        api._answer_active_sip_before_open = fail_answer
+        controller = PanelCallController(
+            hass, api, config_entry_id="entry-1", enabled=False
+        )
+        self._setup_runtime(hass, api, controller)
+
+        result = await handler(SimpleNamespace(data={}))
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(events, ["end"])
+
+    async def test_silence_without_active_call_returns_skipped(self):
+        hass = FakeHass()
+        await actions.async_setup_actions(hass)
+        handler = hass.services.registered[("domonap", "silence_active_call")]
+
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        controller = PanelCallController(
+            hass, api, config_entry_id="entry-1", enabled=False
+        )
+        self._setup_runtime(hass, api, controller)
+
+        result = await handler(SimpleNamespace(data={}))
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertIsNone(result["call_id"])
 
 
 if __name__ == "__main__":

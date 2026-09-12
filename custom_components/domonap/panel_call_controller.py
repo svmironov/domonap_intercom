@@ -188,9 +188,18 @@ class PanelCallController:
         """Door opening always ends the call, matching the panel APK."""
         return True
 
+    async def end_call(self, *, source: str = "manual") -> dict[str, Any] | None:
+        """Terminate every active call leg without touching the relay.
+
+        Used by the silence/reject services: the panel SIP session and the
+        optional external Asterisk leg are ended together, exactly like the
+        relay flow does after opening a door.
+        """
+        return await self._end_all_call_legs(source=source, end_external=True)
+
     async def end_after_relay(self, *, source: str = "relay") -> dict[str, Any] | None:
         """Terminate every active call leg after a successful relay opening."""
-        return await self._end_all_call_legs(source=source, end_external=True)
+        return await self.end_call(source=source)
 
     async def _forward_to_external(
         self, panel_call: RubetekPanelSipCall, call_id: str

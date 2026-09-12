@@ -16,6 +16,8 @@ _LOGGER = logging.getLogger(__name__)
 SERVICE_OPEN_RELAY_BY_DOOR_ID = "open_relay_by_door_id"
 SERVICE_OPEN_RELAY_BY_KEY_ID = "open_relay_by_key_id"
 SERVICE_OPEN_RELAY_BY_LAST_CALL_DOOR_ID = "open_relay_by_last_call_door_id"
+SERVICE_SILENCE_ACTIVE_CALL = "silence_active_call"
+SERVICE_REJECT_ACTIVE_CALL = "reject_active_call"
 
 SERVICE_OPEN_RELAY_BY_DOOR_ID_SCHEMA = vol.Schema(
     {
@@ -34,6 +36,12 @@ SERVICE_OPEN_RELAY_BY_KEY_ID_SCHEMA = vol.Schema(
 SERVICE_OPEN_RELAY_BY_LAST_CALL_DOOR_ID_SCHEMA = vol.Schema(
     {
         vol.Optional("entity_id"): cv.entity_id,
+        vol.Optional("config_entry_id"): cv.string,
+    }
+)
+
+SERVICE_ACTIVE_CALL_SCHEMA = vol.Schema(
+    {
         vol.Optional("config_entry_id"): cv.string,
     }
 )
@@ -152,6 +160,23 @@ async def _finish_relay_action(hass: HomeAssistant, entry_id: str, api: Any) -> 
     return await _end_active_call(hass, api)
 
 
+async def _answer_panel_leg(api: Any) -> dict[str, Any] | None:
+    """Answer the ringing panel SIP leg (200 OK) without opening the door.
+
+    Best effort only: a SIP problem must never block the call teardown that
+    follows. Mirrors openDoorSilentlyAndEndCall(): the 200 OK wins the forked
+    call and the intercom panel stops ringing without any media in HA.
+    """
+    answer = getattr(api, "_answer_active_sip_before_open", None)
+    if not callable(answer):
+        return None
+    try:
+        return await answer()
+    except Exception:
+        _LOGGER.debug("Panel SIP pre-answer failed", exc_info=True)
+        return {"ok": False, "error": "exception"}
+
+
 async def async_setup_actions(hass: HomeAssistant) -> None:
     """Register Domonap actions (services)."""
 
@@ -259,6 +284,75 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
             "response": res,
         }
 
+    async def handle_silence_active_call(call: ServiceCall) -> dict[str, Any]:
+        """Answer the active call and end it so the intercom stops ringing.
+
+        Mirrors the APK openDoorSilentlyAndEndCall() ordering minus the relay:
+        answer first (200 OK wins the forked call and mutes the panel), then
+        terminate every call leg. No media ever flows through HA.
+        """
+        requested_entry_id: str | None = call.data.get("config_entry_id")
+        entry_id = _select_entry_id(hass, requested_entry_id)
+        if not entry_id:
+            return {"status": "error", "reason": "no_config_entries"}
+
+        runtime = _entry_runtime(hass, entry_id)
+        api = runtime.get(API)
+        controller = runtime.get(CALL_CONTROLLER)
+        if api is None:
+            return {"status": "error", "reason": "api_unavailable", "config_entry_id": entry_id}
+
+        call_id = getattr(api, "active_call_id", None)
+        answered: Any = None
+        if controller is None or not controller.external_call_established:
+            answered = await _answer_panel_leg(api)
+
+        if controller is not None:
+            end_result = await controller.end_call(source="home_assistant_silence")
+        else:
+            end_result = await _end_active_call(hass, api)
+
+        ok = isinstance(end_result, dict) and end_result.get("ok") is True
+        return {
+            "status": "ok" if ok else ("skipped" if end_result is None else "error"),
+            "call_id": call_id or None,
+            "answered": bool(isinstance(answered, dict) and answered.get("ok") is True),
+            "end_call_result": end_result,
+            "config_entry_id": entry_id,
+        }
+
+    async def handle_reject_active_call(call: ServiceCall) -> dict[str, Any]:
+        """End the active call without answering it (603 Decline while ringing).
+
+        Mirrors the APK decline button: endCallSmart() with isCallAccepted
+        false rejects our branch. The panel may keep ringing for other
+        residents until someone answers or it times out.
+        """
+        requested_entry_id: str | None = call.data.get("config_entry_id")
+        entry_id = _select_entry_id(hass, requested_entry_id)
+        if not entry_id:
+            return {"status": "error", "reason": "no_config_entries"}
+
+        runtime = _entry_runtime(hass, entry_id)
+        api = runtime.get(API)
+        controller = runtime.get(CALL_CONTROLLER)
+        if api is None:
+            return {"status": "error", "reason": "api_unavailable", "config_entry_id": entry_id}
+
+        call_id = getattr(api, "active_call_id", None)
+        if controller is not None:
+            end_result = await controller.end_call(source="home_assistant_reject")
+        else:
+            end_result = await _end_active_call(hass, api)
+
+        ok = isinstance(end_result, dict) and end_result.get("ok") is True
+        return {
+            "status": "ok" if ok else ("skipped" if end_result is None else "error"),
+            "call_id": call_id or None,
+            "end_call_result": end_result,
+            "config_entry_id": entry_id,
+        }
+
     hass.services.async_register(
         DOMAIN,
         SERVICE_OPEN_RELAY_BY_DOOR_ID,
@@ -281,6 +375,22 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
         supports_response=True,
     )
 
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SILENCE_ACTIVE_CALL,
+        handle_silence_active_call,
+        schema=SERVICE_ACTIVE_CALL_SCHEMA,
+        supports_response=True,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REJECT_ACTIVE_CALL,
+        handle_reject_active_call,
+        schema=SERVICE_ACTIVE_CALL_SCHEMA,
+        supports_response=True,
+    )
+
 
 async def async_unload_actions(hass: HomeAssistant) -> None:
     """Unregister Domonap actions (services)."""
@@ -288,6 +398,8 @@ async def async_unload_actions(hass: HomeAssistant) -> None:
         SERVICE_OPEN_RELAY_BY_DOOR_ID,
         SERVICE_OPEN_RELAY_BY_KEY_ID,
         SERVICE_OPEN_RELAY_BY_LAST_CALL_DOOR_ID,
+        SERVICE_SILENCE_ACTIVE_CALL,
+        SERVICE_REJECT_ACTIVE_CALL,
     ):
         try:
             hass.services.async_remove(DOMAIN, service)

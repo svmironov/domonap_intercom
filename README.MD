@@ -153,6 +153,22 @@ origin: LOCAL
 - `domonap_receive_message`;
 - `domonap_user_status_changed`.
 
+### Ручное управление звонком
+
+Два сервиса работают с активным звонком Rubetek Panel без открытия двери:
+
+```yaml
+# Принять (SIP 200 OK) и сразу завершить — панель домофона замолкает,
+# медиа через Home Assistant не проходит.
+action: domonap.silence_active_call
+
+# Завершить не отвечая (603 Decline) — наша ветка звонка прекращается,
+# панель может продолжать звонить другим жильцам.
+action: domonap.reject_active_call
+```
+
+Оба сервиса принимают опциональный `config_entry_id` (важно при нескольких аккаунтах) и возвращают ответ со статусом для автоматизаций. Для phone/SMS-профиля SIP-ноги нет: `silence`/`reject` просто отправляют `NotifyCallEnded` как fallback.
+
 ### Примеры
 
 Минимальное уведомление в мобильное приложение Home Assistant:
