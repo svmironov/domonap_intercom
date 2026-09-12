@@ -238,9 +238,11 @@ class DomonapSipCall:
         """End the call: BYE when answered, 603 Decline while still ringing.
 
         Mirrors the app: accept-then-hang-up sends BYE, declining a ringing
-        call rejects only this branch with 603.
+        call rejects only this branch with 603. A call that was already ended
+        (our BYE or the remote side) reports success without new signaling:
+        a UAS must not answer an INVITE with 3xx-6xx after a 2xx.
         """
-        if self._answered and not self._ended:
+        if self._answered:
             return await self._end_answered_call(timeout)
         return await self._reject_invite(timeout)
 

@@ -164,6 +164,40 @@ class PanelSipLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["method"], "sip_decline")
         self.assertEqual(sent[0][0], "SIP/2.0 603 Decline")
 
+    async def test_end_after_bye_returns_already_ended(self):
+        """A second end() must not 603-decline an already-answered INVITE."""
+        call = panel_sip.RubetekPanelSipCall("user", "secret", "sip.example", 5060)
+        call._local_host = "10.0.0.20"
+        call._local_port = 51234
+        call._invite = sip._SipMessage(
+            "INVITE sip:user@sip.example SIP/2.0",
+            {
+                "via": ["SIP/2.0/TCP 10.0.0.1:5060;branch=br4"],
+                "from": "<sip:panel@sip.example>;tag=remote",
+                "to": "<sip:user@sip.example>",
+                "call-id": ["call-1@sip.example"],
+                "cseq": ["1 INVITE"],
+                "contact": ["<sip:panel@10.0.0.1:5060;transport=tcp>"],
+            },
+            b"",
+        )
+        call._invite_event.set()
+        call._ack_event.set()
+        call._answered = True
+        call._ended = True
+        sent = []
+
+        async def fake_send(start_line, headers, body=b""):
+            sent.append(start_line)
+
+        call._send = fake_send
+
+        result = await call.end(timeout=0.1)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["already_ended"])
+        self.assertEqual(sent, [])
+
     async def test_unregister_sends_zero_expiry_and_clears_registration(self):
         call = panel_sip.RubetekPanelSipCall("user", "secret", "sip.example", 5060)
         call._registered_event.set()
