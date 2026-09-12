@@ -39,6 +39,29 @@ class RubetekPanelRuntimeConsumer(RubetekPanelNotifyConsumer):
                     self._api.start_active_sip_call(push_data)
                     if self._call_controller is not None:
                         self._call_controller.on_incoming_call(push_data)
+                elif event_message == "DomofonCallAnswered":
+                    # Another resident answered the forked call. The APK runs
+                    # endCallSmart() unless this device accepted the call itself
+                    # (onCallAnsweredPush + isCallAccepted). The equivalent of a
+                    # locally accepted call is an established external SIP leg.
+                    established = bool(
+                        self._call_controller is not None
+                        and self._call_controller.external_call_established
+                    )
+                    if not established:
+                        if self._call_controller is not None:
+                            await self._call_controller.on_panel_call_ended(call_id)
+                        destroy = getattr(
+                            self._api, "destroy_active_sip_session", None
+                        )
+                        if callable(destroy):
+                            await destroy(
+                                call_id,
+                                reason="signalr_call_answered_elsewhere",
+                                terminate_dialog=True,
+                            )
+                        else:
+                            self._api.clear_active_call(call_id)
                 elif event_message == "DomofonCallEnded":
                     if self._call_controller is not None:
                         await self._call_controller.on_panel_call_ended(call_id)

@@ -508,14 +508,6 @@ class IntercomAPI:
             return res
         return {"ok": True, "body": res}
 
-    async def answer_call_notify(self, call_id: str):
-        payload = {"callId": call_id}
-        res = await self._post("/communication-api/Call/NotifyCallAnswered", payload, need_auth=True, expect="text")
-        if isinstance(res, dict) and "error" in res:
-            return res
-        _LOGGER.debug("answer_call_notify(%s) -> %s", call_id, res)
-        return {"ok": True, "body": res}
-
     @property
     def active_call_id(self) -> Optional[str]:
         """Return the call currently reported as active by the notification hub."""

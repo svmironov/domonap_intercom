@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -11,6 +12,12 @@ from .external_sip_signaling import AsteriskSipAccount, ExternalSipConfig, parse
 from .panel_sip import RubetekPanelSipCall
 
 _LOGGER = logging.getLogger(__name__)
+
+# EndCallTimer.TIMER_MILLIS = 0xea60 in the APK: the panel caps a call at 60
+# seconds. The countdown starts when the call arrives (TelephonyService) and is
+# restarted once the SIP call connects (CallOrchestrator.observeSipEvents), so
+# neither ringing nor an established conversation outlives this limit.
+CALL_TIMER_SECONDS = 60.0
 
 
 class PanelCallController:
@@ -33,6 +40,7 @@ class PanelCallController:
         domain: str = "",
         transport: str = "udp",
         call_number: str = "",
+        call_timer_seconds: float = CALL_TIMER_SECONDS,
     ) -> None:
         self._hass = hass
         self._api = api
@@ -48,6 +56,11 @@ class PanelCallController:
         self._active_door_id: str | None = None
         self._forward_task: asyncio.Task | None = None
         self._ending_all_legs = False
+        self._call_timer_seconds = float(call_timer_seconds)
+        self._call_timer_tick = max(0.05, min(1.0, self._call_timer_seconds / 20.0))
+        self._call_timer_task: asyncio.Task | None = None
+        self._call_deadline: float | None = None
+        self._call_timer_restarted_on_answer = False
 
     @property
     def enabled(self) -> bool:
@@ -85,6 +98,7 @@ class PanelCallController:
         await self._account.start()
 
     async def stop(self) -> None:
+        self._cancel_call_timer()
         task = self._forward_task
         self._forward_task = None
         if task is not None and not task.done():
@@ -105,6 +119,9 @@ class PanelCallController:
         self._active_door_id = self._string_value(
             push_data.get("DoorId") or push_data.get("doorId")
         )
+        # The APK EndCallTimer runs for every incoming call, with or without a
+        # forwarding target, so start it before the external SIP check.
+        self._start_call_timer()
         if not self._enabled or self._account is None:
             return
 
@@ -125,6 +142,7 @@ class PanelCallController:
         normalized = self._string_value(call_id)
         if normalized and self._active_call_id and normalized != self._active_call_id:
             return
+        self._cancel_call_timer()
         call = self._account.active_call if self._account else None
         if call is not None:
             try:
@@ -221,6 +239,71 @@ class PanelCallController:
         await self._end_all_call_legs(
             source="external_sip_peer_hangup", end_external=False
         )
+
+    def _start_call_timer(self) -> None:
+        """Mirror the APK EndCallTimer: cap the current call at the time limit."""
+        self._call_deadline = time.monotonic() + self._call_timer_seconds
+        self._call_timer_restarted_on_answer = False
+        if self._call_timer_task is None or self._call_timer_task.done():
+            self._call_timer_task = asyncio.create_task(
+                self._call_timer_loop(), name="domonap_panel_call_timer"
+            )
+
+    def _cancel_call_timer(self) -> None:
+        self._call_deadline = None
+        self._call_timer_restarted_on_answer = False
+        task = self._call_timer_task
+        self._call_timer_task = None
+        if (
+            task is not None
+            and not task.done()
+            and task is not asyncio.current_task()
+        ):
+            task.cancel()
+
+    async def _call_timer_loop(self) -> None:
+        """End every call leg once the APK call deadline expires.
+
+        The panel starts this countdown on the incoming push and restarts it
+        when the SIP call connects. Establishment is observed by polling the
+        external leg state because the Asterisk bridge exposes no callback.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._call_timer_tick)
+                if self._active_call_id is None and not self.external_call_active:
+                    # No call in flight: nothing to time out. A later incoming
+                    # push restarts the timer through _start_call_timer().
+                    self._call_deadline = None
+                    self._call_timer_restarted_on_answer = False
+                    continue
+
+                if (
+                    self.external_call_established
+                    and not self._call_timer_restarted_on_answer
+                ):
+                    # SIP CONNECTED restarts the countdown in the APK.
+                    self._call_timer_restarted_on_answer = True
+                    self._call_deadline = (
+                        time.monotonic() + self._call_timer_seconds
+                    )
+                    _LOGGER.debug(
+                        "Panel call timer restarted on established external leg"
+                    )
+
+                deadline = self._call_deadline
+                if deadline is not None and time.monotonic() >= deadline:
+                    _LOGGER.info(
+                        "Panel call %s reached the %.0fs limit; ending all call legs",
+                        self._active_call_id,
+                        self._call_timer_seconds,
+                    )
+                    await self._end_all_call_legs(
+                        source="call_timer", end_external=True
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
 
     async def _end_all_call_legs(
         self,
@@ -351,6 +434,7 @@ class PanelCallController:
             }
         finally:
             self._ending_all_legs = False
+            self._cancel_call_timer()
 
     async def _open_panel_relay_only(self, door_id: str) -> Any:
         """Resolve DoorId -> KeyId without changing either SIP dialog."""

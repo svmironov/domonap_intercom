@@ -74,7 +74,14 @@ Domonap  <----------------> Home Assistant <----------------> Asterisk
 
 Исходный SDP Domonap передаётся Asterisk без изменения, а SDP answer Asterisk передаётся обратно Domonap без изменения. NAT, RTP, codec negotiation и transcoding должны быть настроены на Asterisk.
 
-Сейчас поддерживается UDP на внешнем SIP leg. Для DTMF `1` leg Asterisk → Home Assistant должен использовать SIP INFO (`dtmf_mode=info`). Успешное открытие двери через DTMF, Home Assistant или Telegram завершает текущий вызов на обоих SIP legs, повторяя поведение Rubetek Panel APK.
+Жизненный цикл вызова повторяет приложение Domonap:
+
+- открытие двери всегда завершает вызов на обеих SIP-ногах; перед открытием реле панельная SIP-нога принимается (200 OK), что останавливает звонок панели домофона;
+- вызов ограничен 60 секундами (счётчик стартует при входящем вызове и перезапускается при ответе), как `EndCallTimer` в приложении;
+- если вызов ответил другой жилец (`DomofonCallAnswered`), Home Assistant завершает свои ноги вызова, кроме случая, когда абонент Asterisk уже ответил;
+- REST `NotifyCallEnded` отправляется только как fallback, когда временная SIP-регистрация не удалась — при живой регистрации завершение сигнализируется через SIP BYE/reject, как `endCallSmart()` в приложении.
+
+Сейчас поддерживается UDP на внешнем SIP leg. Для DTMF `1` leg Asterisk → Home Assistant должен использовать SIP INFO (`dtmf_mode=info`). Успешное открытие двери через DTMF, Home Assistant или Telegram завершает текущий вызов на обоих SIP legs, повторяя поведение приложения.
 
 > SIP-функциональность пока экспериментальная: на отдельных вызовах завершение временной Domonap SIP-сессии может вести себя нестабильно. Для диагностики используйте SIP logger Asterisk и DEBUG-логи интеграции.
 
@@ -136,6 +143,8 @@ origin: LOCAL
 - `OriginalPhotoUrl` — оригинальный `photoUrl` из истории звонков Domonap для диагностики.
 - `PushPhotoUrl` — исходный `photoUrl` из push-события, если Domonap его прислал.
 - `VideoPreview` — авторизованное превью вызова.
+- `WebrtcVideoUrl` / `webrtcVideoUrl` — live WHEP-поток вызова из push-события (приложение использует его как превью входящего звонка).
+- `DoorAddresses` — список дверей вызова (`doorId` + `address`), если Domonap прислал несколько.
 
 ### Другие события
 
