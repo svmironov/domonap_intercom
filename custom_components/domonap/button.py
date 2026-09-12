@@ -211,7 +211,6 @@ class IntercomDoor(ButtonEntity):
             "name": self._name,
             "manufacturer": "Domonap",
             "model": "Intercom Device",
-            "via_device": (DOMAIN, self._key_id),
         }
 
     async def async_press(self):
