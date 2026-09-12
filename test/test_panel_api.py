@@ -28,7 +28,7 @@ def load_module(name: str, filename: str):
 
 
 load_module("custom_components.domonap.sip", "sip.py")
-load_module("custom_components.domonap.api", "api.py")
+api_module = load_module("custom_components.domonap.api", "api.py")
 panel_api = load_module("custom_components.domonap.panel_api", "panel_api.py")
 RubetekPanelIntercomAPI = panel_api.RubetekPanelIntercomAPI
 
@@ -138,6 +138,90 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["ok"], False)
         self.assertEqual(opened, [])
 
+    async def test_phone_open_by_door_id_answers_sip_before_relay(self):
+        """The phone profile mutes the panel the same way the app does.
+
+        The base IntercomAPI answers its SIP session before the relay REST
+        call: 200 OK wins the forked call, the panel stops ringing, and no
+        media ever flows through Home Assistant.
+        """
+        api = api_module.IntercomAPI(
+            device_token="0123456789abcdef0123456789abcdef",
+            instance_id="0123456789abcdef",
+        )
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True, "method": "sip_answer"}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_post(path, payload=None, **kwargs):
+            events.append(("open", path, payload))
+            return ""
+
+        api._post = fake_post
+
+        result = await api.open_relay_by_door_id("door-9")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["answer", ("open", "/client-api/Device/OpenRelayByDoorId", {"doorId": "door-9"})])
+
+    async def test_phone_open_by_key_id_answers_sip_before_relay(self):
+        api = api_module.IntercomAPI(
+            device_token="0123456789abcdef0123456789abcdef",
+            instance_id="0123456789abcdef",
+        )
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True, "method": "sip_answer"}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_post(path, payload=None, **kwargs):
+            events.append(("open", path))
+            return ""
+
+        api._post = fake_post
+
+        result = await api.open_relay_by_key_id("key-9")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["answer", ("open", "/client-api/Device/OpenRelayByKeyId")])
+
+    async def test_phone_open_relay_without_active_call_skips_answer(self):
+        """No incoming call: the relay must open without touching SIP."""
+        api = api_module.IntercomAPI(
+            device_token="0123456789abcdef0123456789abcdef",
+            instance_id="0123456789abcdef",
+        )
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_post(path, payload=None, **kwargs):
+            events.append("open")
+            return ""
+
+        api._post = fake_post
+
+        result = await api.open_relay_by_door_id("door-9")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["open"])
+
     async def test_panel_notify_call_ended_matches_apk_contract(self):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         calls = []
@@ -182,12 +266,7 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         api.get_paged_keys = fake_get_paged_keys
         api.open_relay_by_key_id = fake_open_by_key_id
 
-        original = panel_api.RubetekPanelSipCall
-        panel_api.RubetekPanelSipCall = FakePanelSipCall
-        try:
-            result = await api.open_relay_by_door_id("door-1")
-        finally:
-            panel_api.RubetekPanelSipCall = original
+        result = await api.open_relay_by_door_id("door-1")
 
         self.assertTrue(result["ok"])
         self.assertEqual(events, ["answer", "open"])

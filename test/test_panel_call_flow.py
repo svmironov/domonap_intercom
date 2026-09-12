@@ -29,7 +29,7 @@ def load_module(name: str, filename: str):
 
 
 load_module("custom_components.domonap.sip", "sip.py")
-load_module("custom_components.domonap.api", "api.py")
+api_module = load_module("custom_components.domonap.api", "api.py")
 panel_api = load_module("custom_components.domonap.panel_api", "panel_api.py")
 load_module("custom_components.domonap.panel_sip", "panel_sip.py")
 load_module(
@@ -349,17 +349,46 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self._setup_runtime(hass, api, controller)
 
-        original = panel_api.RubetekPanelSipCall
-        panel_api.RubetekPanelSipCall = FakePanelSipCall
-        try:
-            result = await handler(SimpleNamespace(data={}))
-        finally:
-            panel_api.RubetekPanelSipCall = original
+        result = await handler(SimpleNamespace(data={}))
 
         self.assertEqual(result["status"], "ok")
         self.assertTrue(result["answered"])
         # Answer must happen before the teardown, so the 200 OK mutes the
         # panel even for this door-less path.
+        self.assertEqual(events, ["answer", "end"])
+
+    async def test_silence_works_for_phone_profile(self):
+        """Phone/SMS entries answer their SIP session too, like the app."""
+        hass = FakeHass()
+        await actions.async_setup_actions(hass)
+        handler = hass.services.registered[("domonap", "silence_active_call")]
+
+        api = api_module.IntercomAPI(
+            device_token="0123456789abcdef0123456789abcdef",
+            instance_id="0123456789abcdef",
+        )
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True, "method": "sip_answer"}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_end_active_call():
+            events.append("end")
+            return {"ok": True}
+
+        api.end_active_call = fake_end_active_call
+        # No CALL_CONTROLLER in the runtime: that is the phone/SMS layout.
+        hass.data["domonap"] = {"entry-1": {"api": api}}
+
+        result = await handler(SimpleNamespace(data={}))
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["answered"])
         self.assertEqual(events, ["answer", "end"])
 
     async def test_silence_skips_answer_when_external_leg_established(self):

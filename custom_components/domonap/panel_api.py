@@ -289,25 +289,6 @@ class RubetekPanelIntercomAPI(IntercomAPI):
         self._active_sip_call_id = call_id or self._active_call_id
         self._active_sip_call.start()
 
-    async def _answer_active_sip_before_open(self) -> Dict[str, Any] | None:
-        """Answer the ringing SIP leg before opening, matching the panel APK."""
-        sip_call = self._active_sip_call
-        if not self._active_call_id or not isinstance(sip_call, RubetekPanelSipCall):
-            return None
-        try:
-            result = await sip_call.answer(timeout=2.0)
-        except Exception as err:
-            _LOGGER.warning("Panel SIP answer before relay opening failed: %s", err)
-            return {"ok": False, "error": str(err)}
-        if not (isinstance(result, dict) and result.get("ok") is True):
-            _LOGGER.warning("Panel SIP answer before relay opening failed: %s", result)
-        else:
-            _LOGGER.info(
-                "Panel SIP call %s answered before relay opening",
-                self._active_call_id,
-            )
-        return result
-
     async def open_relay_by_door_id(self, door_id: str):
         """Open a panel relay by resolving DoorId to the user's KeyId first.
 

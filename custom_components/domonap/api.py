@@ -496,6 +496,7 @@ class IntercomAPI:
 
     async def open_relay_by_door_id(self, door_id: str):
         payload = {"doorId": door_id}
+        await self._answer_active_sip_before_open()
         res = await self._post("/client-api/Device/OpenRelayByDoorId", payload, need_auth=True, expect="text")
         if isinstance(res, dict) and "error" in res:
             return res
@@ -503,10 +504,38 @@ class IntercomAPI:
 
     async def open_relay_by_key_id(self, key_id: str):
         payload = {"keyId": key_id}
+        await self._answer_active_sip_before_open()
         res = await self._post("/client-api/Device/OpenRelayByKeyId", payload, need_auth=True, expect="text")
         if isinstance(res, dict) and "error" in res:
             return res
         return {"ok": True, "body": res}
+
+    async def _answer_active_sip_before_open(self) -> Dict[str, Any] | None:
+        """Answer the active SIP call before a relay action, like the app.
+
+        The app accepts the incoming call before requesting the relay opening.
+        That ordering matters for forked calls: rejecting our still-ringing
+        branch does not stop the originating panel while accepting it does.
+        Answering sends a 200 OK with a no-media SDP, so the panel goes silent
+        without any audio flowing through Home Assistant.
+        """
+        sip_call = self._active_sip_call
+        answer = getattr(sip_call, "answer", None)
+        if not self._active_call_id or not callable(answer):
+            return None
+        try:
+            result = await sip_call.answer(timeout=2.0)
+        except Exception as err:
+            _LOGGER.warning("SIP answer before relay opening failed: %s", err)
+            return {"ok": False, "error": str(err)}
+        if not (isinstance(result, dict) and result.get("ok") is True):
+            _LOGGER.warning("SIP answer before relay opening failed: %s", result)
+        else:
+            _LOGGER.info(
+                "SIP call %s answered before relay opening",
+                self._active_call_id,
+            )
+        return result
 
     @property
     def active_call_id(self) -> Optional[str]:
