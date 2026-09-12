@@ -222,6 +222,79 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(events, ["open"])
 
+    async def test_panel_end_active_call_skips_stale_call_id(self):
+        """A teardown for an old call must not touch the replacement call."""
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-new")
+        destroyed = []
+
+        class FakeSipCall:
+            has_invite = True
+            registered = True
+
+            async def destroy(self, **kwargs):
+                destroyed.append("destroy")
+                return {"ok": True, "method": "sip_destroy"}
+
+        sip_call = FakeSipCall()
+        api._active_sip_call = sip_call
+
+        result = await api.end_active_call(expected_call_id="call-old")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "call_replaced")
+        self.assertEqual(destroyed, [])
+        self.assertEqual(api.active_call_id, "call-new")
+        self.assertIs(api._active_sip_call, sip_call)
+
+    async def test_reject_mode_skips_answer_before_relay(self):
+        """call_end_mode=reject opens the door without accepting the call."""
+        api = api_module.IntercomAPI(
+            device_token="0123456789abcdef0123456789abcdef",
+            instance_id="0123456789abcdef",
+        )
+        api.call_end_mode = "reject"
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_post(path, payload=None, **kwargs):
+            events.append("open")
+            return ""
+
+        api._post = fake_post
+
+        result = await api.open_relay_by_door_id("door-9")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["open"])
+
+    async def test_reject_mode_still_allows_forced_answer(self):
+        """The silence service forces the answer regardless of the mode."""
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.call_end_mode = "reject"
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True}
+
+        api._active_sip_call = FakeSipCall()
+
+        result = await api._answer_active_sip_before_open(force=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["answer"])
+
     async def test_panel_notify_call_ended_matches_apk_contract(self):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         calls = []

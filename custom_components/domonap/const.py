@@ -38,6 +38,10 @@ OPT_EXTERNAL_SIP_TRANSPORT = "external_sip_transport"
 OPT_EXTERNAL_SIP_CALL_NUMBER = "external_sip_call_number"
 EXTERNAL_SIP_TRANSPORT_UDP = "udp"
 
+OPT_CALL_END_MODE = "call_end_mode"
+CALL_END_MODE_ANSWER = "answer"
+CALL_END_MODE_REJECT = "reject"
+
 EVENT_INCOMING_CALL = "domonap_incoming_call"
 EVENT_CALL_ANSWERED = "domonap_call_answered"
 EVENT_CALL_ENDED = "domonap_call_ended"

@@ -426,18 +426,30 @@ class RubetekPanelIntercomAPI(IntercomAPI):
                 _LOGGER.warning("Panel SIP session destruction failed: %s", err)
                 return {"ok": False, "error": str(err)}
 
-    async def end_active_call(self) -> Dict[str, Any] | None:
+    async def end_active_call(
+        self, expected_call_id: Optional[str] = None
+    ) -> Dict[str, Any] | None:
         """End the Panel call the way CallOrchestrator.endCallSmart() does.
 
         The APK posts NotifyCallEnded only while the temporary SIP account is
         not registered (sipRegState != Ok): REST is the fallback for a call that
-        cannot be terminated over SIP. A registered leg signals the end through
-        BYE/reject inside ``destroy()`` and skips the REST notification.
+        cannot be terminated over SIP. A registered session signals the end
+        through BYE/reject inside ``destroy()`` and skips the REST notification.
+
+        ``expected_call_id`` guards against overlapping calls: when a newer
+        call already replaced the active one, nothing is torn down.
         """
         async with self._active_call_lock:
             call_id = self._active_call_id
             if not call_id:
                 return None
+            if expected_call_id is not None and call_id != expected_call_id:
+                _LOGGER.debug(
+                    "Active call moved from %s to %s; skipping stale teardown",
+                    expected_call_id,
+                    call_id,
+                )
+                return {"ok": True, "skipped": True, "reason": "call_replaced"}
 
             sip_call = self._active_sip_call
             sip_registered = bool(getattr(sip_call, "registered", False))
@@ -472,8 +484,9 @@ class RubetekPanelIntercomAPI(IntercomAPI):
             else:
                 sip_result = None
 
-            # notifyCallEnded was only launched for an unregistered leg. Keep its
-            # result for diagnostics, but never use it to delay SIP teardown.
+            # notifyCallEnded was only launched for an unregistered session.
+            # Keep its result for diagnostics, but never use it to delay SIP
+            # teardown.
             if notify_task is not None:
                 notify_result = await notify_task
             else:

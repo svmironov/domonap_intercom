@@ -43,7 +43,7 @@ class RubetekPanelRuntimeConsumer(RubetekPanelNotifyConsumer):
                     # Another resident answered the forked call. The APK runs
                     # endCallSmart() unless this device accepted the call itself
                     # (onCallAnsweredPush + isCallAccepted). The equivalent of a
-                    # locally accepted call is an established external SIP leg.
+                    # locally accepted call is an established external SIP dialog.
                     established = bool(
                         self._call_controller is not None
                         and self._call_controller.external_call_established

@@ -82,12 +82,14 @@
           "external_sip_password": "SIP Password",
           "external_sip_domain": "SIP domain",
           "external_sip_transport": "Transport",
-          "external_sip_call_number": "Call number"
+          "external_sip_call_number": "Call number",
+          "call_end_mode": "Call end mode"
         },
         "data_description": {
           "external_sip_domain": "For example: 192.168.10.1:5060",
           "external_sip_transport": "UDP is currently supported",
-          "external_sip_call_number": "For example: 100; configure the SIP leg toward Home Assistant with dtmf_mode=info for DTMF 1"
+          "external_sip_call_number": "For example: 100; configure the SIP leg toward Home Assistant with dtmf_mode=info for DTMF 1",
+          "call_end_mode": "answer — accept the call before ending it (200 OK mutes the intercom panel, then BYE). reject — decline the call right away (603, does not mute the panel, faster on unreliable SIP)."
         }
       }
     }

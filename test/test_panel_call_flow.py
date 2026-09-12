@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from homeassistant.exceptions import HomeAssistantError
+
 ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "custom_components" / "domonap"
 
@@ -90,7 +92,7 @@ class FakeController:
 
 
 class PanelRuntimeConsumerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_call_answered_elsewhere_tears_down_local_legs(self):
+    async def test_call_answered_elsewhere_ends_local_call(self):
         """DomofonCallAnswered must silence a call that nobody accepted here.
 
         IncomingCallReceiver.onAnsweredByAnotherResident() runs
@@ -140,7 +142,7 @@ class PanelRuntimeConsumerTests(unittest.IsolatedAsyncioTestCase):
             any(event_type == "domonap_call_answered" for event_type, _ in hass.bus.events)
         )
 
-    async def test_call_answered_elsewhere_keeps_established_external_leg(self):
+    async def test_call_answered_elsewhere_keeps_established_call(self):
         """A locally accepted call survives the answered-elsewhere push."""
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         api.set_active_call("call-123")
@@ -226,7 +228,7 @@ class PanelCallTimerTests(unittest.IsolatedAsyncioTestCase):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         ended = []
 
-        async def fake_end_active_call():
+        async def fake_end_active_call(expected_call_id=None):
             ended.append(time.monotonic())
             return {"ok": True}
 
@@ -264,7 +266,7 @@ class PanelCallTimerTests(unittest.IsolatedAsyncioTestCase):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         ended = []
 
-        async def fake_end_active_call():
+        async def fake_end_active_call(expected_call_id=None):
             ended.append(time.monotonic())
             return {"ok": True}
 
@@ -292,7 +294,7 @@ class PanelCallTimerTests(unittest.IsolatedAsyncioTestCase):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         ended = []
 
-        async def fake_end_active_call():
+        async def fake_end_active_call(expected_call_id=None):
             ended.append(time.monotonic())
             return {"ok": True}
 
@@ -339,7 +341,7 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
 
         api._active_sip_call = FakePanelSipCall()
 
-        async def fake_end_active_call():
+        async def fake_end_active_call(expected_call_id=None):
             events.append("end")
             return {"ok": True}
 
@@ -377,7 +379,7 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
 
         api._active_sip_call = FakeSipCall()
 
-        async def fake_end_active_call():
+        async def fake_end_active_call(expected_call_id=None):
             events.append("end")
             return {"ok": True}
 
@@ -391,7 +393,7 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["answered"])
         self.assertEqual(events, ["answer", "end"])
 
-    async def test_silence_skips_answer_when_external_leg_established(self):
+    async def test_silence_skips_answer_when_external_call_established(self):
         hass = FakeHass()
         await actions.async_setup_actions(hass)
         handler = hass.services.registered[("domonap", "silence_active_call")]
@@ -418,7 +420,7 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "ok")
         self.assertFalse(result["answered"])
-        # The panel leg is already answered here: a second 200 OK must not
+        # The panel call is already answered here: a second 200 OK must not
         # be attempted on an established dialog.
         self.assertEqual(answers, [])
 
@@ -432,7 +434,7 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
         api.set_active_call("call-123")
         events = []
 
-        async def fake_end_active_call():
+        async def fake_end_active_call(expected_call_id=None):
             events.append("end")
             return {"ok": True}
 
@@ -472,6 +474,119 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "skipped")
         self.assertIsNone(result["call_id"])
+
+    async def test_failed_relay_open_ends_already_answered_call(self):
+        """A failed opening must not leave the muted call hanging (B3)."""
+        hass = FakeHass()
+        await actions.async_setup_actions(hass)
+        handler = hass.services.registered[("domonap", "open_relay_by_door_id")]
+
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True, "method": "sip_answer"}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_post(path, payload=None, **kwargs):
+            events.append("open_failed")
+            return {"error": "HTTP 500", "status": 500}
+
+        api._post = fake_post
+
+        async def fake_end_active_call(expected_call_id=None):
+            events.append("end")
+            api.set_active_call(None)
+            return {"ok": True}
+
+        api.end_active_call = fake_end_active_call
+        controller = PanelCallController(
+            hass, api, config_entry_id="entry-1", enabled=False
+        )
+        self._setup_runtime(hass, api, controller)
+
+        with self.assertRaises(HomeAssistantError):
+            await handler(SimpleNamespace(data={"door_id": "door-1"}))
+
+        self.assertEqual(
+            events, ["answer", "open_failed", "end"]
+        )
+        self.assertIsNone(api.active_call_id)
+
+    async def test_silence_answers_even_in_reject_mode(self):
+        """silence_active_call mutes the panel regardless of call_end_mode."""
+        hass = FakeHass()
+        await actions.async_setup_actions(hass)
+        handler = hass.services.registered[("domonap", "silence_active_call")]
+
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.call_end_mode = "reject"
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True, "method": "sip_answer"}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_end_active_call(expected_call_id=None):
+            events.append("end")
+            return {"ok": True}
+
+        api.end_active_call = fake_end_active_call
+        controller = PanelCallController(
+            hass, api, config_entry_id="entry-1", enabled=False
+        )
+        self._setup_runtime(hass, api, controller)
+
+        result = await handler(SimpleNamespace(data={}))
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["answered"])
+        self.assertEqual(events, ["answer", "end"])
+
+
+class ExternalForwardFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forward_failure_tears_down_call_without_errors(self):
+        """A dial failure must clean up the call, not crash the forward task."""
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-123")
+        ended = []
+
+        async def fake_end_active_call(expected_call_id=None):
+            ended.append(expected_call_id)
+            api.set_active_call(None)
+            return {"ok": True}
+
+        api.end_active_call = fake_end_active_call
+
+        controller = PanelCallController(
+            FakeHass(), api, config_entry_id="entry-1", enabled=True
+        )
+
+        class FailingAccount:
+            @property
+            def active_call(self):
+                return None
+
+            async def dial(self, panel_call, *, call_id):
+                raise RuntimeError("asterisk unreachable")
+
+        controller._account = FailingAccount()
+
+        class FakePanelSipCall:
+            pass
+
+        await controller._forward_to_external(FakePanelSipCall(), "call-123")
+
+        self.assertEqual(ended, ["call-123"])
+        self.assertIsNone(api.active_call_id)
 
 
 if __name__ == "__main__":

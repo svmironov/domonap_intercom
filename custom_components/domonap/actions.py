@@ -149,7 +149,7 @@ async def _finish_relay_action(hass: HomeAssistant, entry_id: str, api: Any) -> 
     """Finish a successful relay action using the runtime's call policy.
 
     Rubetek Panel follows the APK behavior: opening the door ends the call. When
-    an Asterisk leg exists, the controller terminates that dialog and the
+    an Asterisk dialog exists, the controller terminates that dialog and the
     temporary Domonap Panel SIP session together. Legacy phone/SMS entries keep
     using their existing API call termination path.
     """
@@ -160,8 +160,23 @@ async def _finish_relay_action(hass: HomeAssistant, entry_id: str, api: Any) -> 
     return await _end_active_call(hass, api)
 
 
-async def _answer_panel_leg(api: Any) -> dict[str, Any] | None:
-    """Answer the ringing panel SIP leg (200 OK) without opening the door.
+async def _abort_relay_call(hass: HomeAssistant, entry_id: str, api: Any) -> Any:
+    """Best-effort call teardown after a failed relay opening.
+
+    The mute-before-open answer may already have been sent, so a failed
+    opening must not leave the accepted call hanging. Uses the runtime call
+    policy when a controller exists so an external Asterisk dialog is torn
+    down together with the Domonap call.
+    """
+    runtime = _entry_runtime(hass, entry_id)
+    controller = runtime.get(CALL_CONTROLLER)
+    if controller is not None:
+        return await controller.end_call(source="relay_open_failed")
+    return await _end_active_call(hass, api)
+
+
+async def _answer_panel_call(api: Any) -> dict[str, Any] | None:
+    """Answer the ringing panel SIP call (200 OK) without opening the door.
 
     Best effort only: a SIP problem must never block the call teardown that
     follows. Mirrors openDoorSilentlyAndEndCall(): the 200 OK wins the forked
@@ -171,7 +186,7 @@ async def _answer_panel_leg(api: Any) -> dict[str, Any] | None:
     if not callable(answer):
         return None
     try:
-        return await answer()
+        return await answer(force=True)
     except Exception:
         _LOGGER.debug("Panel SIP pre-answer failed", exc_info=True)
         return {"ok": False, "error": "exception"}
@@ -200,6 +215,9 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
             await _finish_relay_action(hass, entry_id, api)
             return
 
+        # The call may already be answered (mute-before-open); a failed relay
+        # must not leave it hanging without a door behind it.
+        await _abort_relay_call(hass, entry_id, api)
         _LOGGER.error("Failed to open relay by door_id=%s entry_id=%s: %s", door_id, entry_id, res)
         raise HomeAssistantError(f"Failed to open relay by door_id={door_id}")
 
@@ -223,6 +241,9 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
             await _finish_relay_action(hass, entry_id, api)
             return
 
+        # The call may already be answered (mute-before-open); a failed relay
+        # must not leave it hanging without a door behind it.
+        await _abort_relay_call(hass, entry_id, api)
         _LOGGER.error("Failed to open relay by key_id=%s entry_id=%s: %s", key_id, entry_id, res)
         raise HomeAssistantError(f"Failed to open relay by key_id={key_id}")
 
@@ -272,6 +293,10 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
         end_call_result: Any = None
         if ok:
             end_call_result = await _finish_relay_action(hass, entry_id, api)
+        else:
+            # The call may already be answered (mute-before-open); a failed
+            # relay must not leave it hanging without a door behind it.
+            end_call_result = await _abort_relay_call(hass, entry_id, api)
 
         return {
             "status": "ok" if ok else "error",
@@ -289,7 +314,7 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
 
         Mirrors the APK openDoorSilentlyAndEndCall() ordering minus the relay:
         answer first (200 OK wins the forked call and mutes the panel), then
-        terminate every call leg. No media ever flows through HA.
+        terminate the call. No media ever flows through HA.
         """
         requested_entry_id: str | None = call.data.get("config_entry_id")
         entry_id = _select_entry_id(hass, requested_entry_id)
@@ -305,7 +330,7 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
         call_id = getattr(api, "active_call_id", None)
         answered: Any = None
         if controller is None or not controller.external_call_established:
-            answered = await _answer_panel_leg(api)
+            answered = await _answer_panel_call(api)
 
         if controller is not None:
             end_result = await controller.end_call(source="home_assistant_silence")

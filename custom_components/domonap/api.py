@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, Optional, Union
 from uuid import UUID
 
 from .sip import DomonapSipCall
+from .const import CALL_END_MODE_ANSWER
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -133,6 +134,10 @@ class IntercomAPI:
         self._active_call_lock = asyncio.Lock()
         self._active_sip_call: Optional[DomonapSipCall] = None
         self._active_sip_call_id: Optional[str] = None
+        # How an active call is ended around relay actions: "answer" accepts it
+        # first (200 OK mutes the panel) and hangs up with BYE, "reject" declines
+        # with 603 right away.
+        self.call_end_mode: str = CALL_END_MODE_ANSWER
         # Порядок и формат заголовков как у DeviceIdInterceptor приложения:
         # dom-app/dom-platform с суффиксом ";", instanceId — БЕЗ ";", плюс
         # device-info с JSON профиля устройства.
@@ -510,7 +515,7 @@ class IntercomAPI:
             return res
         return {"ok": True, "body": res}
 
-    async def _answer_active_sip_before_open(self) -> Dict[str, Any] | None:
+    async def _answer_active_sip_before_open(self, *, force: bool = False) -> Dict[str, Any] | None:
         """Answer the active SIP call before a relay action, like the app.
 
         The app accepts the incoming call before requesting the relay opening.
@@ -518,7 +523,12 @@ class IntercomAPI:
         branch does not stop the originating panel while accepting it does.
         Answering sends a 200 OK with a no-media SDP, so the panel goes silent
         without any audio flowing through Home Assistant.
+
+        Skipped in the "reject" call-end mode unless ``force`` is set (the
+        silence service always mutes the panel regardless of the mode).
         """
+        if not force and self.call_end_mode != CALL_END_MODE_ANSWER:
+            return None
         sip_call = self._active_sip_call
         answer = getattr(sip_call, "answer", None)
         if not self._active_call_id or not callable(answer):
