@@ -376,17 +376,22 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
         controller = EstablishedController()
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         api.set_active_call("call-123")
+        answers = []
 
-        async def fail_answer(self, timeout=2.0, **kwargs):
-            raise AssertionError("Panel leg is already answered; must not re-answer")
+        async def recording_answer():
+            answers.append("answer")
+            return {"ok": True}
 
-        api._answer_active_sip_before_open = fail_answer
+        api._answer_active_sip_before_open = recording_answer
         self._setup_runtime(hass, api, controller)
 
         result = await handler(SimpleNamespace(data={}))
 
         self.assertEqual(result["status"], "ok")
         self.assertFalse(result["answered"])
+        # The panel leg is already answered here: a second 200 OK must not
+        # be attempted on an established dialog.
+        self.assertEqual(answers, [])
 
     async def test_reject_ends_without_answering(self):
         """reject_active_call: no 200 OK, straight to teardown (603 path)."""
@@ -403,11 +408,13 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
             return {"ok": True}
 
         api.end_active_call = fake_end_active_call
+        answers = []
 
-        async def fail_answer():
-            raise AssertionError("reject must not answer the SIP leg")
+        async def recording_answer():
+            answers.append("answer")
+            return {"ok": True}
 
-        api._answer_active_sip_before_open = fail_answer
+        api._answer_active_sip_before_open = recording_answer
         controller = PanelCallController(
             hass, api, config_entry_id="entry-1", enabled=False
         )
@@ -417,6 +424,9 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(events, ["end"])
+        # Reject must never answer: a 200 OK would mute the panel, which is
+        # exactly what this service must not do.
+        self.assertEqual(answers, [])
 
     async def test_silence_without_active_call_returns_skipped(self):
         hass = FakeHass()
