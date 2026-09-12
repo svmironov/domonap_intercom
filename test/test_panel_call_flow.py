@@ -84,6 +84,13 @@ class PanelRuntimeConsumerTests(unittest.IsolatedAsyncioTestCase):
         hass = FakeHass()
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         api.set_active_call("call-123")
+        notified = []
+
+        async def fake_notify(call_id):
+            notified.append(call_id)
+            return {"ok": True, "body": ""}
+
+        api.end_call_notify = fake_notify
         controller = FakeController(established=False)
         consumer = RubetekPanelRuntimeConsumer(
             hass,
@@ -111,6 +118,8 @@ class PanelRuntimeConsumerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(controller.ended_calls, ["call-123"])
         self.assertIsNone(api.active_call_id)
+        # No SIP session existed, so endCallSmart()'s REST fallback fires.
+        self.assertEqual(notified, ["call-123"])
         self.assertTrue(
             any(event_type == "domonap_call_answered" for event_type, _ in hass.bus.events)
         )
@@ -119,6 +128,11 @@ class PanelRuntimeConsumerTests(unittest.IsolatedAsyncioTestCase):
         """A locally accepted call survives the answered-elsewhere push."""
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         api.set_active_call("call-123")
+
+        async def fake_notify(call_id):
+            raise AssertionError("NotifyCallEnded must not fire for a live call")
+
+        api.end_call_notify = fake_notify
         controller = FakeController(established=True)
         consumer = RubetekPanelRuntimeConsumer(
             FakeHass(),
@@ -146,6 +160,48 @@ class PanelRuntimeConsumerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(controller.ended_calls, [])
         self.assertEqual(api.active_call_id, "call-123")
+
+    async def test_call_answered_elsewhere_skips_notify_for_newer_call(self):
+        """A stale push must not touch or report the session of a newer call."""
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-new")
+        notified = []
+
+        async def fake_notify(call_id):
+            notified.append(call_id)
+            return {"ok": True, "body": ""}
+
+        api.end_call_notify = fake_notify
+        controller = FakeController(established=False)
+        consumer = RubetekPanelRuntimeConsumer(
+            FakeHass(),
+            api,
+            None,
+            None,
+            config_entry_id="entry-1",
+            call_controller=controller,
+        )
+
+        await consumer._handle_invocation(
+            {
+                "target": "ReceivePush",
+                "arguments": [
+                    "",
+                    "",
+                    {
+                        "EventMessage": "DomofonCallAnswered",
+                        "CallId": "call-old",
+                        "DoorId": "door-1",
+                    },
+                ],
+            }
+        )
+
+        # The teardown itself is skipped by destroy_active_sip_session's
+        # call-id guard, and the REST fallback must not fire either.
+        self.assertEqual(controller.ended_calls, ["call-old"])
+        self.assertEqual(notified, [])
+        self.assertEqual(api.active_call_id, "call-new")
 
 
 class PanelCallTimerTests(unittest.IsolatedAsyncioTestCase):

@@ -509,9 +509,14 @@ class RubetekPanelIntercomAPI(IntercomAPI):
             sip_ok = isinstance(sip_result, dict) and sip_result.get("ok") is True
             ok = sip_ok if sip_expected else (sip_ok or notify_ok)
 
-            self._active_sip_call = None
-            self._active_sip_call_id = None
-            self._active_call_id = None
+            # A new call may have replaced this session while the teardown was
+            # running (double ring, call waiting). Only clear the state that
+            # still belongs to the call being ended.
+            if self._active_call_id == call_id:
+                self._active_call_id = None
+            if self._active_sip_call is sip_call:
+                self._active_sip_call = None
+                self._active_sip_call_id = None
 
             return {
                 "ok": ok,

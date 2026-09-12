@@ -247,6 +247,57 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["notify"]["ok"])
         self.assertIsNone(api.active_call_id)
 
+    async def test_panel_end_active_call_keeps_replacement_call_state(self):
+        """A new call arriving during teardown must not be wiped (race guard)."""
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-old")
+        notified = []
+
+        class FakeSipCall:
+            has_invite = True
+            registered = False
+
+            def __init__(self):
+                self.destroyed = False
+
+            async def destroy(self, **kwargs):
+                self.destroyed = True
+                # A new call lands while the old one is being torn down.
+                api.set_active_call("call-new")
+                return {"ok": True, "method": "sip_destroy"}
+
+        old_call = FakeSipCall()
+        new_call = FakeSipCall()
+        api._active_sip_call = old_call
+
+        async def fake_notify(call_id):
+            notified.append(call_id)
+            return {"ok": True, "body": ""}
+
+        api.end_call_notify = fake_notify
+
+        # Simulate start_active_sip_call replacing the session mid-teardown.
+        original_destroy = api._destroy_panel_sip_call
+
+        async def destroy_with_replacement(sip_call, **kwargs):
+            result = await original_destroy(sip_call, **kwargs)
+            api._active_sip_call = new_call
+            api._active_sip_call_id = "call-new"
+            api._active_call_id = "call-new"
+            return result
+
+        api._destroy_panel_sip_call = destroy_with_replacement
+
+        result = await api.end_active_call()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(old_call.destroyed)
+        self.assertFalse(new_call.destroyed)
+        # The replacement call keeps its state: only the old call was reported.
+        self.assertEqual(notified, ["call-old"])
+        self.assertEqual(api.active_call_id, "call-new")
+        self.assertIs(api._active_sip_call, new_call)
+
     async def test_panel_end_active_call_does_not_wait_for_missing_invite(self):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         api.set_active_call("call-123")

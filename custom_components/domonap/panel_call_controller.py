@@ -98,7 +98,13 @@ class PanelCallController:
         await self._account.start()
 
     async def stop(self) -> None:
+        timer_task = self._call_timer_task
         self._cancel_call_timer()
+        if timer_task is not None and not timer_task.done():
+            try:
+                await timer_task
+            except asyncio.CancelledError:
+                pass
         task = self._forward_task
         self._forward_task = None
         if task is not None and not task.done():
@@ -410,7 +416,7 @@ class PanelCallController:
                 )
 
             ok = external_ok and domonap_ok
-            if domonap_ok:
+            if domonap_ok and self._active_call_id in (None, call_id):
                 self._active_call_id = None
                 self._active_door_id = None
 
@@ -434,7 +440,10 @@ class PanelCallController:
             }
         finally:
             self._ending_all_legs = False
-            self._cancel_call_timer()
+            # Do not cancel a call timer that a newer incoming call started
+            # while this teardown was still running.
+            if self._active_call_id in (None, call_id):
+                self._cancel_call_timer()
 
     async def _open_panel_relay_only(self, door_id: str) -> Any:
         """Resolve DoorId -> KeyId without changing either SIP dialog."""
