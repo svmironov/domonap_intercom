@@ -48,6 +48,28 @@ def fake_jwt(role="Panel", user_id="panel-user"):
 
 
 class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_key_requests_load_all_active_doors(self):
+        api = api_module.IntercomAPI()
+        calls = []
+
+        async def fake_post(path, payload=None, **kwargs):
+            calls.append((path, payload, kwargs))
+            return {"results": [], "pageCount": 0}
+
+        api._post = fake_post
+        await api.get_paged_keys()
+
+        self.assertEqual(calls[0][0], "/client-api/Key/GetPagedKeysByKeysType")
+        self.assertEqual(
+            calls[0][1],
+            {
+                "currentPage": 1,
+                "perPage": 100,
+                "keysType": "Active",
+                "search": None,
+            },
+        )
+
     def test_panel_identity_matches_captured_aosp_contract(self):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         self.assertEqual(api.headers["dom-app"], "panel;")

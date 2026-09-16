@@ -481,7 +481,8 @@ class IntercomAPI:
         if user:
             return user.get("userProfile").get("username")
 
-    async def get_paged_keys(self, per_page: int = 100, current_page: int = 1, keys_type: str = "Main"):
+    async def get_paged_keys(self, per_page: int = 100, current_page: int = 1, keys_type: str = "Active"):
+        """Return a page of usable keys; ``Main`` contains only favorites."""
         payload = {
             "currentPage": current_page,
             "perPage": per_page,
