@@ -107,11 +107,11 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
                 ]
             }
 
-        async def fake_open_by_key_id(key_id):
+        async def fake_open_by_key_id(key_id, **kwargs):
             opened.append(key_id)
             return {"ok": True, "body": ""}
 
-        api.get_paged_keys = fake_get_paged_keys
+        api.get_keys = fake_get_paged_keys
         api.open_relay_by_key_id = fake_open_by_key_id
 
         result = await api.open_relay_by_door_id("door-target")
@@ -126,11 +126,11 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         async def fake_get_paged_keys(*args, **kwargs):
             return {"results": [{"id": "key-other", "doorId": "door-other"}]}
 
-        async def fake_open_by_key_id(key_id):
+        async def fake_open_by_key_id(key_id, **kwargs):
             opened.append(key_id)
             return {"ok": True}
 
-        api.get_paged_keys = fake_get_paged_keys
+        api.get_keys = fake_get_paged_keys
         api.open_relay_by_key_id = fake_open_by_key_id
 
         result = await api.open_relay_by_door_id("door-target")
@@ -332,11 +332,11 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         async def fake_get_paged_keys(*args, **kwargs):
             return {"results": [{"id": "key-1", "doorId": "door-1"}]}
 
-        async def fake_open_by_key_id(key_id):
+        async def fake_open_by_key_id(key_id, **kwargs):
             events.append("open")
             return {"ok": True, "body": ""}
 
-        api.get_paged_keys = fake_get_paged_keys
+        api.get_keys = fake_get_paged_keys
         api.open_relay_by_key_id = fake_open_by_key_id
 
         result = await api.open_relay_by_door_id("door-1")

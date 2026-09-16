@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from urllib.parse import urljoin
@@ -38,6 +39,7 @@ class DomonapWebRTCProxy:
         self._hass = hass
         self._targets: dict[tuple[str, str], WebRTCProxyTarget] = {}
         self._sessions: dict[str, WebRTCProxySession] = {}
+        self._offer_tasks: dict[asyncio.Task, object] = {}
 
     def register_camera(
         self,
@@ -55,6 +57,21 @@ class DomonapWebRTCProxy:
 
     def unregister_camera(self, proxy_secret: str, camera_id: str) -> None:
         self._targets.pop((proxy_secret, camera_id), None)
+
+    async def close_for_api(self, api) -> None:
+        """Remove targets first so in-flight offers cannot leave new sessions."""
+        for key, target in list(self._targets.items()):
+            if target.api is api:
+                self._targets.pop(key, None)
+        await asyncio.gather(
+            *(task for task, owner in list(self._offer_tasks.items()) if owner is api),
+            return_exceptions=True,
+        )
+        await asyncio.gather(
+            *(self.delete_session(key) for key, session in list(self._sessions.items())
+              if session.api is api),
+            return_exceptions=True,
+        )
 
     def get_proxy_path(self, proxy_secret: str, camera_id: str) -> str:
         return f"/api/{DOMAIN}/webrtc_proxy/{proxy_secret}/{camera_id}/whep"
@@ -83,6 +100,14 @@ class DomonapWebRTCProxy:
         if target is None:
             raise web.HTTPNotFound(text="Unknown camera stream")
 
+        task = asyncio.current_task()
+        self._offer_tasks[task] = target.api
+        try:
+            return await self._create_session(proxy_secret, camera_id, offer_sdp, target)
+        finally:
+            self._offer_tasks.pop(task, None)
+
+    async def _create_session(self, proxy_secret, camera_id, offer_sdp, target):
         response = await target.api.create_whep_session(target.whep_url, offer_sdp)
         if not response.get("ok"):
             _LOGGER.warning(
@@ -91,6 +116,12 @@ class DomonapWebRTCProxy:
                 response.get("error"),
             )
             raise web.HTTPBadGateway(text=str(response.get("error", "WHEP offer failed")))
+
+        if self._targets.get((proxy_secret, camera_id)) is not target:
+            await target.api.close_whep_session(
+                _resolve_upstream_session_url(target.whep_url, response["location"])
+            )
+            raise web.HTTPNotFound(text="Camera stream was removed")
 
         session_id = uuid4().hex
         session_url = self._session_url(session_id)

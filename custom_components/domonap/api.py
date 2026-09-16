@@ -2,6 +2,7 @@ import json
 import logging
 import aiohttp
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timezone
 from hashlib import sha256
 from secrets import token_bytes
@@ -9,6 +10,7 @@ from typing import Any, Callable, Dict, Optional, Union
 from uuid import UUID
 
 from .sip import DomonapSipCall
+from .runtime_status import RuntimeStatus
 from .const import CALL_END_MODE_ANSWER
 
 _LOGGER = logging.getLogger(__name__)
@@ -154,6 +156,11 @@ class IntercomAPI:
         self._session: Optional[aiohttp.ClientSession] = None
         self._external_session: Optional[aiohttp.ClientSession] = None
         self._closed = False
+        self.config_entry_id: str | None = None
+        self.runtime_status = RuntimeStatus()
+        self._keys_lock = asyncio.Lock()
+        self._keys_cache = None
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._closed:
@@ -171,16 +178,29 @@ class IntercomAPI:
             self._external_session = aiohttp.ClientSession(timeout=timeout)
         return self._external_session
 
+    def _track_task(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        def done(completed):
+            self._background_tasks.discard(completed)
+            if not completed.cancelled() and completed.exception() is not None:
+                _LOGGER.warning("SIP background cleanup failed", exc_info=completed.exception())
+        task.add_done_callback(done)
+        return task
+
     async def close(self):
         self._closed = True
-        if self._active_sip_call is not None:
-            await self._active_sip_call.stop()
+        try:
+            if self._active_sip_call is not None:
+                await self._active_sip_call.stop()
+        finally:
             self._active_sip_call = None
             self._active_sip_call_id = None
-        if self._session and not self._session.closed:
-            await self._session.close()
-        if self._external_session and not self._external_session.closed:
-            await self._external_session.close()
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            sessions = [session.close() for session in (self._session, self._external_session)
+                        if session is not None and not session.closed]
+            await asyncio.gather(*sessions, return_exceptions=True)
+            self._keys_cache = None
 
     async def __aenter__(self):
         await self._ensure_session()
@@ -300,7 +320,14 @@ class IntercomAPI:
             result = await self.update_token()
             return bool(isinstance(result, dict) and result.get("ok"))
 
-    async def _post(
+    async def _post(self, *args, **kwargs):
+        try:
+            return await self._post_request(*args, **kwargs)
+        except Exception as err:
+            self.runtime_status.failed("http", type(err).__name__)
+            raise
+
+    async def _post_request(
         self,
         path: str,
         payload: Optional[Dict[str, Any]] = None,
@@ -335,28 +362,30 @@ class IntercomAPI:
             if send_auth and self.access_token:
                 headers["Authorization"] = f"Bearer {self.access_token}"
             if payload is None:
-                return await session.post(url, headers=headers, ssl=False)
-            return await session.post(url, json=payload, headers=headers, ssl=False)
+                return await session.post(url, headers=headers)
+            return await session.post(url, json=payload, headers=headers)
 
         resp = await _do()
-        if resp.status == 401 and retry_on_401 and self.refresh_token:
-            _LOGGER.warning("401 Unauthorized, refreshing token and retrying %s", path)
-            if await self._refresh_for_retry(first_try_access_token):
-                resp = await _do()
-
-        if 200 <= resp.status < 300:
-            if expect == "json":
-                return await resp.json()
-            return await resp.text()
-
-        body_text = ""
         try:
+            if resp.status == 401 and retry_on_401 and self.refresh_token:
+                # Release the first response before refreshing/retrying, including
+                # when refreshing itself raises or is cancelled.
+                resp.release()
+                if await self._refresh_for_retry(first_try_access_token):
+                    resp = await _do()
+                else:
+                    return self._refresh_unavailable_error("Session expired")
+
+            if 200 <= resp.status < 300:
+                return await resp.json() if expect == "json" else await resp.text()
             body_text = await resp.text()
-        except Exception:
-            pass
-        err = {"error": f"HTTP {resp.status}", "status": resp.status, "body": body_text[:2000]}
-        _LOGGER.error("Request failed: POST %s payload=%s -> %s", path, payload, err)
-        return err
+            err = {"error": f"HTTP {resp.status}", "status": resp.status, "body": body_text[:2000]}
+            # Auth endpoints carry credentials; never log request/response bodies.
+            self.runtime_status.failed("http", f"HTTP {resp.status}")
+            _LOGGER.error("Request failed: POST %s status=%s", path, resp.status)
+            return err
+        finally:
+            resp.release()
 
     async def update_device_token(self, device_token: str) -> bool:
         _LOGGER.debug("UpdateDeviceToken start")
@@ -461,6 +490,44 @@ class IntercomAPI:
         }
         return await self._post("/client-api/Key/GetPagedKeysByKeysType", payload, need_auth=True, expect="json")
 
+    async def get_keys(self):
+        """Load all doors once per account runtime; reload the entry to refresh.
+
+        Failed or partial reads never replace the cache. Concurrent callers share
+        the refresh lock; pagination without metadata ends on a short page.
+        """
+        async with self._keys_lock:
+            if self._keys_cache is not None:
+                return deepcopy(self._keys_cache)
+            keys = []
+            seen = set()
+            for page in range(1, 1001):
+                response = await self.get_paged_keys(current_page=page)
+                if not isinstance(response, dict) or not isinstance(response.get("results"), list):
+                    if isinstance(response, dict) and "error" in response:
+                        return response
+                    return {"ok": False, "error": "Unexpected key list response"}
+                if "error" in response:
+                    return response
+                batch = response["results"]
+                previous_count = len(keys)
+                for key in batch:
+                    if not isinstance(key, dict) or key.get("id") is None:
+                        continue
+                    key_id = str(key["id"])
+                    if key_id not in seen:
+                        keys.append(key)
+                        seen.add(key_id)
+                page_count = response.get("pageCount")
+                if (isinstance(page_count, int) and page >= page_count) or (
+                    page_count is None and len(batch) < 100
+                ):
+                    self._keys_cache = {"results": keys}
+                    return deepcopy(self._keys_cache)
+                if len(keys) == previous_count:
+                    return {"ok": False, "error": "Key pagination made no progress"}
+            return {"ok": False, "error": "Key pagination limit exceeded"}
+
     async def get_video_area(self):
         return await self._post(
             "/client-api/VideoCamera/GetVideoArea",
@@ -507,9 +574,13 @@ class IntercomAPI:
             return res
         return {"ok": True, "body": res}
 
-    async def open_relay_by_key_id(self, key_id: str):
+    async def open_relay_by_key_id(
+        self, key_id: str, *, answer_before_open: bool = True
+    ):
+        """Open a relay, optionally skipping an answer already handled by the caller."""
         payload = {"keyId": key_id}
-        await self._answer_active_sip_before_open()
+        if answer_before_open:
+            await self._answer_active_sip_before_open()
         res = await self._post("/client-api/Device/OpenRelayByKeyId", payload, need_auth=True, expect="text")
         if isinstance(res, dict) and "error" in res:
             return res
@@ -536,9 +607,11 @@ class IntercomAPI:
         try:
             result = await sip_call.answer(timeout=2.0)
         except Exception as err:
+            self.runtime_status.failed("sip", type(err).__name__)
             _LOGGER.warning("SIP answer before relay opening failed: %s", err)
             return {"ok": False, "error": str(err)}
         if not (isinstance(result, dict) and result.get("ok") is True):
+            self.runtime_status.failed("sip", "answer_failed")
             _LOGGER.warning("SIP answer before relay opening failed: %s", result)
         else:
             _LOGGER.info(
@@ -601,7 +674,7 @@ class IntercomAPI:
 
         previous = self._active_sip_call
         if previous is not None:
-            asyncio.create_task(previous.stop())
+            self._track_task(previous.stop())
         self._active_sip_call = DomonapSipCall(
             str(account), str(password), str(domain), port
         )
@@ -617,12 +690,14 @@ class IntercomAPI:
             self._active_sip_call = None
             self._active_sip_call_id = None
             if sip_call is not None:
-                asyncio.create_task(sip_call.stop())
+                self._track_task(sip_call.stop())
 
-    async def end_active_call(self):
+    async def end_active_call(self, *, expected_call_id: str | None = None):
         """End the current call once and return the API response, if any."""
         async with self._active_call_lock:
             call_id = self._active_call_id
+            if expected_call_id and call_id != expected_call_id:
+                return {"ok": True, "skipped": True, "reason": "call_replaced"}
             if not call_id:
                 return None
 

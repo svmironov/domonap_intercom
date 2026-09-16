@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+
+import asyncio
 import logging
 from typing import Optional, Callable
 
@@ -11,6 +13,8 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN, API, EVENT_INCOMING_CALL
 from .util import event_belongs_to_entry, panel_entity_prefix, scoped_entity_unique_id
 
+from .util import scoped_device_id
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -19,7 +23,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     api = hass.data[DOMAIN][config_entry.entry_id][API]
     panel_scoped = bool(panel_entity_prefix(config_entry))
 
-    response = await api.get_paged_keys()
+    response = await api.get_keys()
     keys = response.get("results", [])
 
     for key in keys:
@@ -69,7 +73,7 @@ class IntercomCallImageEntity(ImageEntity):
         panel_scoped: bool,
         unique_id: str,
     ):
-        super().__init__(hass)
+        super().__init__(hass, verify_ssl=True)
         self._api = api
         self._key_id = key_id
         self._door_id = door_id
@@ -81,6 +85,9 @@ class IntercomCallImageEntity(ImageEntity):
         self._unique_id = unique_id
         self._image_bytes: Optional[bytes] = None
         self._unsub: Optional[Callable[[], None]] = None
+        self._fetch_task: asyncio.Task | None = None
+        self._generation = 0
+        self._removed = False
 
     @property
     def extra_state_attributes(self):
@@ -94,7 +101,7 @@ class IntercomCallImageEntity(ImageEntity):
     @property
     def device_info(self):
         return {
-            "identifiers": {(DOMAIN, self._key_id)},
+            "identifiers": {(DOMAIN, scoped_device_id(self._api.config_entry_id, self._key_id))},
             "name": self._device_name,
             "manufacturer": "Domonap",
             "model": "Intercom Device",
@@ -106,11 +113,15 @@ class IntercomCallImageEntity(ImageEntity):
         )
 
         if self._photo_url:
-            data = await self._http_get_bytes(self._photo_url)
-            if data:
-                await self._set_image(data)
+            self._start_fetch(self._photo_url)
 
     async def async_will_remove_from_hass(self) -> None:
+        self._removed = True
+        self._generation += 1
+        if self._fetch_task is not None:
+            self._fetch_task.cancel()
+            await asyncio.gather(self._fetch_task, return_exceptions=True)
+            self._fetch_task = None
         if self._unsub:
             self._unsub()
             self._unsub = None
@@ -143,16 +154,28 @@ class IntercomCallImageEntity(ImageEntity):
             "VideoPreview"
         )
 
-        async def _fetch_and_set():
-            data = await self._http_get_bytes(
-                photo_url,
-                authorized=authorized,
-                fallback_url=fallback_url,
-            )
-            if data:
-                await self._set_image(data)
+        self._start_fetch(photo_url, authorized=authorized, fallback_url=fallback_url)
 
-        self.hass.async_create_task(_fetch_and_set())
+    def _start_fetch(self, photo_url, **kwargs):
+        if self._removed:
+            return
+        self._generation += 1
+        generation = self._generation
+        previous = self._fetch_task
+        if previous is not None:
+            previous.cancel()
+
+        async def fetch_and_set():
+            if previous is not None:
+                await asyncio.gather(previous, return_exceptions=True)
+            try:
+                data = await self._http_get_bytes(photo_url, **kwargs)
+                if data and not self._removed and generation == self._generation:
+                    await self._set_image(data)
+            except Exception:
+                _LOGGER.warning("Cannot load Domonap call image", exc_info=True)
+
+        self._fetch_task = self.hass.async_create_task(fetch_and_set())
 
     async def _set_image(self, data: bytes) -> None:
         self._image_bytes = data

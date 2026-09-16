@@ -1,8 +1,5 @@
 from homeassistant.const import Platform
 
-import homeassistant.helpers.config_validation as cv
-import voluptuous as vol
-
 
 DOMAIN = 'domonap'
 API = "api"

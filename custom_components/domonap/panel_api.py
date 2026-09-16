@@ -281,7 +281,7 @@ class RubetekPanelIntercomAPI(IntercomAPI):
                     )
                 )
             else:
-                asyncio.create_task(previous.stop())
+                self._track_task(previous.stop())
 
         self._active_sip_call = RubetekPanelSipCall(
             str(account), str(password), str(domain), port
@@ -289,7 +289,9 @@ class RubetekPanelIntercomAPI(IntercomAPI):
         self._active_sip_call_id = call_id or self._active_call_id
         self._active_sip_call.start()
 
-    async def open_relay_by_door_id(self, door_id: str):
+    async def open_relay_by_door_id(
+        self, door_id: str, *, answer_before_open: bool = True
+    ):
         """Open a panel relay by resolving DoorId to the user's KeyId first.
 
         The Rubetek incoming-call UI answers the SIP call before requesting the
@@ -299,9 +301,10 @@ class RubetekPanelIntercomAPI(IntercomAPI):
         """
         # Best effort only: a SIP problem must never prevent the requested door
         # from opening.
-        await self._answer_active_sip_before_open()
+        if answer_before_open:
+            await self._answer_active_sip_before_open()
 
-        keys_response = await self.get_paged_keys()
+        keys_response = await self.get_keys()
         if not isinstance(keys_response, dict):
             return {
                 "ok": False,
@@ -329,7 +332,9 @@ class RubetekPanelIntercomAPI(IntercomAPI):
                 wanted_door_id,
                 key_id,
             )
-            return await self.open_relay_by_key_id(str(key_id))
+            # The answer policy was applied before resolving the key; do not
+            # retry a failed answer or disturb an established external call.
+            return await self.open_relay_by_key_id(str(key_id), answer_before_open=False)
 
         return {
             "ok": False,

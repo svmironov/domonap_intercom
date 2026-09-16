@@ -128,6 +128,37 @@
       },
       "last_call_door_id": {
         "name": "Last call Door ID"
+      },
+      "signalr": {
+        "name": "SignalR connection",
+        "state": {
+          "connected": "Connected",
+          "disconnected": "Disconnected"
+        }
+      },
+      "sip": {
+        "name": "SIP registration",
+        "state": {
+          "idle": "No call",
+          "registered": "Registered",
+          "unregistered": "Not registered",
+          "disabled": "Disabled"
+        }
+      },
+      "external_sip": {
+        "name": "External SIP registration",
+        "state": {
+          "idle": "No call",
+          "registered": "Registered",
+          "unregistered": "Not registered",
+          "disabled": "Disabled"
+        }
+      },
+      "last_event": {
+        "name": "Last event"
+      },
+      "last_error": {
+        "name": "Last error"
       }
     },
     "camera": {

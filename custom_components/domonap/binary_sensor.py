@@ -6,13 +6,15 @@ from homeassistant.helpers.event import async_call_later
 from .const import DOMAIN, API, EVENT_CALL_ENDED, EVENT_INCOMING_CALL, RESET_DELAY
 from .util import event_belongs_to_entry, panel_entity_prefix, scoped_entity_unique_id
 
+from .util import scoped_device_id
+
 _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
     entities = []
     api = hass.data[DOMAIN][config_entry.entry_id][API]
-    response = await api.get_paged_keys()
+    response = await api.get_keys()
 
     if not isinstance(response, dict):
         _LOGGER.warning(
@@ -117,7 +119,7 @@ class IntercomCallBinarySensor(BinarySensorEntity):
     @property
     def device_info(self):
         return {
-            "identifiers": {(DOMAIN, self._key_id)},
+            "identifiers": {(DOMAIN, scoped_device_id(self._api.config_entry_id, self._key_id))},
             "name": self._name,
             "manufacturer": "Domonap",
             "model": "Intercom Device",

@@ -8,8 +8,10 @@ from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.config_validation as cv
 
-from .const import DOMAIN, API, CALL_CONTROLLER, EVENT_CALL_ENDED
-from .util import extract_phone_digits
+from .const import DOMAIN, API, CALL_CONTROLLER
+from .util import find_last_call_sensor_entity_id
+from .relay import end_active_call, open_relay, raise_for_relay_error
+from homeassistant.helpers import entity_registry as er
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,106 +75,14 @@ def _select_entry_id(hass: HomeAssistant, requested_entry_id: str | None) -> str
     if len(active_entries) == 1:
         return active_entries[0]
 
+    if len(config_entries) > 1:
+        raise HomeAssistantError("Multiple Domonap accounts: specify config_entry_id")
     return config_entries[0][0] if config_entries else None
-
-
-def _find_last_call_sensor_entity_id(hass: HomeAssistant, entry_id: str | None) -> str | None:
-    """Try to find last_call_door_id sensor entity_id."""
-    if entry_id:
-        try:
-            entry = hass.config_entries.async_get_entry(entry_id)
-        except Exception:
-            entry = None
-
-        if entry is not None:
-            phone_digits = extract_phone_digits(entry)
-            if phone_digits:
-                candidate = f"sensor.{phone_digits}_last_call_door_id"
-                if hass.states.get(candidate) is not None:
-                    return candidate
-
-        legacy = f"sensor.{DOMAIN}_{entry_id}_last_call_door_id"
-        if hass.states.get(legacy) is not None:
-            return legacy
-
-    for st in hass.states.async_all("sensor"):
-        if st.entity_id.endswith("_last_call_door_id") and st.entity_id.startswith("sensor."):
-            return st.entity_id
-
-    return None
-
-
-async def _end_active_call(hass: HomeAssistant, api: Any) -> Any:
-    """End an active call without making a successful door opening fail."""
-    call_id = getattr(api, "active_call_id", None)
-    if not call_id:
-        return None
-
-    try:
-        result = await api.end_active_call()
-    except Exception:
-        _LOGGER.exception("Failed to end active call %s after opening the door", call_id)
-        return {"ok": False, "error": "exception"}
-
-    if result is not None and not (isinstance(result, dict) and result.get("ok") is True):
-        _LOGGER.error("Failed to end active call %s after opening the door: %s", call_id, result)
-    elif isinstance(result, dict) and result.get("ok") is True:
-        _LOGGER.info("Active call %s ended after opening the door", call_id)
-        hass.bus.fire(EVENT_CALL_ENDED, {"CallId": call_id})
-    return result
 
 
 def _entry_runtime(hass: HomeAssistant, entry_id: str) -> dict[str, Any]:
     value = hass.data.get(DOMAIN, {}).get(entry_id)
     return value if isinstance(value, dict) else {}
-
-
-async def _open_by_door_id(hass: HomeAssistant, entry_id: str, door_id: str) -> Any:
-    runtime = _entry_runtime(hass, entry_id)
-    controller = runtime.get(CALL_CONTROLLER)
-    if controller is not None:
-        return await controller.open_door_by_door_id(door_id)
-    api = runtime.get(API)
-    return await api.open_relay_by_door_id(door_id)
-
-
-async def _open_by_key_id(hass: HomeAssistant, entry_id: str, key_id: str) -> Any:
-    runtime = _entry_runtime(hass, entry_id)
-    controller = runtime.get(CALL_CONTROLLER)
-    if controller is not None:
-        return await controller.open_door_by_key_id(key_id)
-    api = runtime.get(API)
-    return await api.open_relay_by_key_id(key_id)
-
-
-async def _finish_relay_action(hass: HomeAssistant, entry_id: str, api: Any) -> Any:
-    """Finish a successful relay action using the runtime's call policy.
-
-    Rubetek Panel follows the APK behavior: opening the door ends the call. When
-    an Asterisk dialog exists, the controller terminates that dialog and the
-    temporary Domonap Panel SIP session together. Legacy phone/SMS entries keep
-    using their existing API call termination path.
-    """
-    runtime = _entry_runtime(hass, entry_id)
-    controller = runtime.get(CALL_CONTROLLER)
-    if controller is not None:
-        return await controller.end_after_relay(source="home_assistant_relay")
-    return await _end_active_call(hass, api)
-
-
-async def _abort_relay_call(hass: HomeAssistant, entry_id: str, api: Any) -> Any:
-    """Best-effort call teardown after a failed relay opening.
-
-    The mute-before-open answer may already have been sent, so a failed
-    opening must not leave the accepted call hanging. Uses the runtime call
-    policy when a controller exists so an external Asterisk dialog is torn
-    down together with the Domonap call.
-    """
-    runtime = _entry_runtime(hass, entry_id)
-    controller = runtime.get(CALL_CONTROLLER)
-    if controller is not None:
-        return await controller.end_call(source="relay_open_failed")
-    return await _end_active_call(hass, api)
 
 
 async def _answer_panel_call(api: Any) -> dict[str, Any] | None:
@@ -195,57 +105,23 @@ async def _answer_panel_call(api: Any) -> dict[str, Any] | None:
 async def async_setup_actions(hass: HomeAssistant) -> None:
     """Register Domonap actions (services)."""
 
-    async def handle_open_relay_by_door_id(call: ServiceCall) -> None:
-        door_id: str = call.data["door_id"]
-        requested_entry_id: str | None = call.data.get("config_entry_id")
-
-        entry_id = _select_entry_id(hass, requested_entry_id)
+    async def handle_open_relay(call: ServiceCall, *, by_door: bool) -> None:
+        entry_id = _select_entry_id(hass, call.data.get("config_entry_id"))
         if not entry_id:
-            _LOGGER.error("No Domonap config entries are set up")
             raise HomeAssistantError("No Domonap config entries are set up")
+        runtime = _entry_runtime(hass, entry_id)
+        result = await open_relay(
+            hass, runtime[API], runtime.get(CALL_CONTROLLER),
+            call.data["door_id" if by_door else "key_id"],
+            by_door=by_door, source="home_assistant_relay",
+        )
+        raise_for_relay_error(result)
 
-        api = _entry_runtime(hass, entry_id).get(API)
-        if api is None:
-            _LOGGER.error("Domonap API is not available for entry_id=%s", entry_id)
-            raise HomeAssistantError(f"Domonap API is not available for entry_id={entry_id}")
-
-        res: Any = await _open_by_door_id(hass, entry_id, door_id)
-        if isinstance(res, dict) and res.get("ok") is True:
-            _LOGGER.debug("Door relay opened (door_id=%s, entry_id=%s)", door_id, entry_id)
-            await _finish_relay_action(hass, entry_id, api)
-            return
-
-        # The call may already be answered (mute-before-open); a failed relay
-        # must not leave it hanging without a door behind it.
-        await _abort_relay_call(hass, entry_id, api)
-        _LOGGER.error("Failed to open relay by door_id=%s entry_id=%s: %s", door_id, entry_id, res)
-        raise HomeAssistantError(f"Failed to open relay by door_id={door_id}")
+    async def handle_open_relay_by_door_id(call: ServiceCall) -> None:
+        await handle_open_relay(call, by_door=True)
 
     async def handle_open_relay_by_key_id(call: ServiceCall) -> None:
-        key_id: str = call.data["key_id"]
-        requested_entry_id: str | None = call.data.get("config_entry_id")
-
-        entry_id = _select_entry_id(hass, requested_entry_id)
-        if not entry_id:
-            _LOGGER.error("No Domonap config entries are set up")
-            raise HomeAssistantError("No Domonap config entries are set up")
-
-        api = _entry_runtime(hass, entry_id).get(API)
-        if api is None:
-            _LOGGER.error("Domonap API is not available for entry_id=%s", entry_id)
-            raise HomeAssistantError(f"Domonap API is not available for entry_id={entry_id}")
-
-        res: Any = await _open_by_key_id(hass, entry_id, key_id)
-        if isinstance(res, dict) and res.get("ok") is True:
-            _LOGGER.debug("Door relay opened (key_id=%s, entry_id=%s)", key_id, entry_id)
-            await _finish_relay_action(hass, entry_id, api)
-            return
-
-        # The call may already be answered (mute-before-open); a failed relay
-        # must not leave it hanging without a door behind it.
-        await _abort_relay_call(hass, entry_id, api)
-        _LOGGER.error("Failed to open relay by key_id=%s entry_id=%s: %s", key_id, entry_id, res)
-        raise HomeAssistantError(f"Failed to open relay by key_id={key_id}")
+        await handle_open_relay(call, by_door=False)
 
     async def handle_open_relay_by_last_call_door_id(call: ServiceCall) -> dict[str, Any]:
         """Open door based on last incoming call sensor state."""
@@ -260,10 +136,14 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
 
         entity_id: str | None = call.data.get("entity_id")
         if not entity_id:
-            entity_id = _find_last_call_sensor_entity_id(hass, entry_id)
+            entity_id = find_last_call_sensor_entity_id(hass, entry_id)
 
         if not entity_id:
             return {"status": "error", "reason": "sensor_not_found", "config_entry_id": entry_id}
+
+        registered = er.async_get(hass).async_get(entity_id)
+        if registered is None or registered.config_entry_id != entry_id:
+            return {"status": "error", "reason": "sensor_account_mismatch", "entity_id": entity_id}
 
         st = hass.states.get(entity_id)
         if st is None:
@@ -286,17 +166,15 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
         except Exception:
             door_name = None
 
-        res: Any = await _open_by_door_id(hass, entry_id, door_id)
+        runtime = _entry_runtime(hass, entry_id)
+        result = await open_relay(
+            hass, api, runtime.get(CALL_CONTROLLER), door_id,
+            by_door=True, source="home_assistant_relay",
+        )
+        res = result["response"]
         ok = isinstance(res, dict) and res.get("ok") is True
-
-        call_id = getattr(api, "active_call_id", None)
-        end_call_result: Any = None
-        if ok:
-            end_call_result = await _finish_relay_action(hass, entry_id, api)
-        else:
-            # The call may already be answered (mute-before-open); a failed
-            # relay must not leave it hanging without a door behind it.
-            end_call_result = await _abort_relay_call(hass, entry_id, api)
+        call_id = result["call_id"]
+        end_call_result = result["end_call_result"]
 
         return {
             "status": "ok" if ok else "error",
@@ -309,15 +187,10 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
             "response": res,
         }
 
-    async def handle_silence_active_call(call: ServiceCall) -> dict[str, Any]:
-        """Answer the active call and end it so the intercom stops ringing.
-
-        Mirrors the APK openDoorSilentlyAndEndCall() ordering minus the relay:
-        answer first (200 OK wins the forked call and mutes the panel), then
-        terminate the call. No media ever flows through HA.
-        """
-        requested_entry_id: str | None = call.data.get("config_entry_id")
-        entry_id = _select_entry_id(hass, requested_entry_id)
+    async def handle_active_call(
+        call: ServiceCall, *, silence: bool
+    ) -> dict[str, Any]:
+        entry_id = _select_entry_id(hass, call.data.get("config_entry_id"))
         if not entry_id:
             return {"status": "error", "reason": "no_config_entries"}
 
@@ -329,54 +202,32 @@ async def async_setup_actions(hass: HomeAssistant) -> None:
 
         call_id = getattr(api, "active_call_id", None)
         answered: Any = None
-        if controller is None or not controller.external_call_established:
+        if silence and (controller is None or not controller.external_call_established):
             answered = await _answer_panel_call(api)
 
-        if controller is not None:
-            end_result = await controller.end_call(source="home_assistant_silence")
-        else:
-            end_result = await _end_active_call(hass, api)
+        source = "home_assistant_silence" if silence else "home_assistant_reject"
+        end_result = await end_active_call(
+            hass, api, controller, source=source, expected_call_id=call_id
+        )
 
         ok = isinstance(end_result, dict) and end_result.get("ok") is True
-        return {
+        response = {
             "status": "ok" if ok else ("skipped" if end_result is None else "error"),
             "call_id": call_id or None,
-            "answered": bool(isinstance(answered, dict) and answered.get("ok") is True),
             "end_call_result": end_result,
             "config_entry_id": entry_id,
         }
+        if silence:
+            response["answered"] = isinstance(answered, dict) and answered.get("ok") is True
+        return response
+
+    async def handle_silence_active_call(call: ServiceCall) -> dict[str, Any]:
+        """Answer (200 OK wins the fork and mutes the panel), then end the call."""
+        return await handle_active_call(call, silence=True)
 
     async def handle_reject_active_call(call: ServiceCall) -> dict[str, Any]:
-        """End the active call without answering it (603 Decline while ringing).
-
-        Mirrors the APK decline button: endCallSmart() with isCallAccepted
-        false rejects our branch. The panel may keep ringing for other
-        residents until someone answers or it times out.
-        """
-        requested_entry_id: str | None = call.data.get("config_entry_id")
-        entry_id = _select_entry_id(hass, requested_entry_id)
-        if not entry_id:
-            return {"status": "error", "reason": "no_config_entries"}
-
-        runtime = _entry_runtime(hass, entry_id)
-        api = runtime.get(API)
-        controller = runtime.get(CALL_CONTROLLER)
-        if api is None:
-            return {"status": "error", "reason": "api_unavailable", "config_entry_id": entry_id}
-
-        call_id = getattr(api, "active_call_id", None)
-        if controller is not None:
-            end_result = await controller.end_call(source="home_assistant_reject")
-        else:
-            end_result = await _end_active_call(hass, api)
-
-        ok = isinstance(end_result, dict) and end_result.get("ok") is True
-        return {
-            "status": "ok" if ok else ("skipped" if end_result is None else "error"),
-            "call_id": call_id or None,
-            "end_call_result": end_result,
-            "config_entry_id": entry_id,
-        }
+        """End without answering (603 while ringing); other branches may ring."""
+        return await handle_active_call(call, silence=False)
 
     hass.services.async_register(
         DOMAIN,

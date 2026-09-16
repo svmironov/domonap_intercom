@@ -28,6 +28,8 @@ from .const import API, DOMAIN, PARAM_WEBRTC_PROXY_SECRET, WEBRTC_PROXY
 from .util import scoped_entity_unique_id
 from .webrtc_proxy import _resolve_upstream_session_url
 
+from .util import scoped_device_id
+
 _LOGGER = logging.getLogger(__name__)
 CAMERA_CATEGORY_NAMES = {
     "Parking": "Parking",
@@ -60,7 +62,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     api = hass.data[DOMAIN][config_entry.entry_id][API]
     proxy = hass.data[DOMAIN][WEBRTC_PROXY]
     proxy_secret = config_entry.data.get(PARAM_WEBRTC_PROXY_SECRET)
-    key_response = await api.get_paged_keys()
+    key_response = await api.get_keys()
     key_entities = _build_key_camera_entities(
         config_entry,
         api,
@@ -360,7 +362,7 @@ class IntercomCamera(Camera):
     @property
     def device_info(self):
         return {
-            "identifiers": {(DOMAIN, self._device_identifier)},
+            "identifiers": {(DOMAIN, scoped_device_id(self._api.config_entry_id, self._device_identifier))},
             "name": self._device_name,
             "manufacturer": "Domonap",
             "model": self._device_model,
@@ -396,6 +398,10 @@ class IntercomWebRTCCamera(IntercomCamera):
         self._whep_url = _whep_url_from_webrtc_url(self._webrtc_url)
         self._webrtc_sessions: dict[str, WHEPSession] = {}
         self._pending_candidates = defaultdict(list)
+        self._offer_tokens = {}
+        self._offer_tasks: set[asyncio.Task] = set()
+        self._close_tasks: set[asyncio.Task] = set()
+        self._removing = False
         if self._proxy and self._proxy_secret:
             self._proxy_stream_path = self._proxy.register_camera(
                 self._proxy_secret,
@@ -411,6 +417,23 @@ class IntercomWebRTCCamera(IntercomCamera):
     async def async_handle_async_webrtc_offer(
         self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
     ) -> None:
+        if self._removing:
+            return
+        if session_id in self._webrtc_sessions:
+            self.close_webrtc_session(session_id)
+        token = object()
+        self._offer_tokens[session_id] = token
+        task = asyncio.current_task()
+        self._offer_tasks.add(task)
+        try:
+            await self._async_process_offer(offer_sdp, session_id, send_message, token)
+        finally:
+            self._offer_tasks.discard(task)
+            if self._offer_tokens.get(session_id) is token:
+                self._offer_tokens.pop(session_id, None)
+                self._pending_candidates.pop(session_id, None)
+
+    async def _async_process_offer(self, offer_sdp, session_id, send_message, token):
         if WebRTCAnswer is None or WebRTCError is None:
             _LOGGER.error("Home Assistant WebRTC API is not available")
             return
@@ -423,6 +446,12 @@ class IntercomWebRTCCamera(IntercomCamera):
                     "domonap_webrtc_offer_failed",
                     f"Domonap WHEP offer failed: {response.get('error')}",
                 )
+            )
+            return
+
+        if self._removing or self._offer_tokens.get(session_id) is not token:
+            await self._async_close_whep_session(
+                _resolve_upstream_session_url(self._whep_url, response["location"])
             )
             return
 
@@ -447,7 +476,7 @@ class IntercomWebRTCCamera(IntercomCamera):
         return WebRTCClientConfiguration(data_channel="domonap")
 
     async def async_on_webrtc_candidate(self, session_id: str, candidate) -> None:
-        if not getattr(candidate, "candidate", None):
+        if self._removing or not getattr(candidate, "candidate", None):
             return
 
         if session_id not in self._webrtc_sessions:
@@ -458,16 +487,26 @@ class IntercomWebRTCCamera(IntercomCamera):
 
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
+        self._offer_tokens.pop(session_id, None)
         self._pending_candidates.pop(session_id, None)
         whep_session = self._webrtc_sessions.pop(session_id, None)
         if whep_session is None:
             return
 
-        self.hass.async_create_task(
+        task = self.hass.async_create_task(
             self._async_close_whep_session(whep_session.session_url)
         )
+        self._close_tasks.add(task)
+        task.add_done_callback(self._close_tasks.discard)
 
     async def async_will_remove_from_hass(self) -> None:
+        self._removing = True
+        self._offer_tokens.clear()
+        await asyncio.gather(*self._offer_tasks, return_exceptions=True)
+        for session_id in list(self._webrtc_sessions):
+            self.close_webrtc_session(session_id)
+        await asyncio.gather(*self._close_tasks, return_exceptions=True)
+        self._pending_candidates.clear()
         await super().async_will_remove_from_hass()
         if self._proxy and self._proxy_secret:
             self._proxy.unregister_camera(self._proxy_secret, self.unique_id)

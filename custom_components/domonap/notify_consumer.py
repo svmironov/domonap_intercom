@@ -57,6 +57,7 @@ class IntercomNotifyConsumer:
             except asyncio.CancelledError:
                 raise
             except aiohttp.WSServerHandshakeError as e:
+                self._api.runtime_status.failed("signalr", f"HTTP {e.status}")
                 if e.status == 401:
                     _LOGGER.error("WS 401 Unauthorized: %s", e.headers.get("WWW-Authenticate"))
                 elif e.status == 404:
@@ -64,12 +65,16 @@ class IntercomNotifyConsumer:
                 else:
                     _LOGGER.warning("WS handshake error: status=%s %s", e.status, e)
             except Exception as e:
+                self._api.runtime_status.failed("signalr", type(e).__name__)
                 _LOGGER.warning("Notify loop error: %s: %s", type(e).__name__, e)
             if self._stop_event.is_set():
                 break
             delay = self._reconnect_delay
             _LOGGER.info("WS loop ended, reconnecting in %d seconds...", delay)
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
             self._reconnect_delay = max(1, randint(delay, self._max_reconnect))
 
     async def stop(self) -> None:
@@ -132,7 +137,7 @@ class IntercomNotifyConsumer:
         ws_session = aiohttp.ClientSession()
         try:
             async with ws_session.ws_connect(
-                ws_url, headers=self._headers, receive_timeout=WS_SERVER_TIMEOUT, ssl=False
+                ws_url, headers=self._headers, receive_timeout=WS_SERVER_TIMEOUT
             ) as ws:
                 self._ws = ws
                 _LOGGER.info("WS connected to %s", ws_url)
@@ -157,9 +162,14 @@ class IntercomNotifyConsumer:
                 finally:
                     if ping_task is not None:
                         ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
         except (asyncio.TimeoutError, aiohttp.ServerTimeoutError):
             # serverTimeout: сервер молчит дольше WS_SERVER_TIMEOUT — штатный
             # признак мёртвого соединения, переподключаемся (не ошибка).
+            self._api.runtime_status.failed("signalr", "timeout")
             _LOGGER.warning("WS server timeout, reconnecting")
         finally:
             self._connected = False
@@ -219,11 +229,14 @@ class IntercomNotifyConsumer:
             _LOGGER.debug("Unknown frame type=%s data=%s", t, payload[:200])
 
     async def _handle_invocation(self, data: dict, ws: aiohttp.ClientWebSocketResponse) -> None:
+        self._api.runtime_status.event_received()
         target = data.get("target")
         args: Iterable = data.get("arguments") or []
         if target == "ReceivePush":
             push_data = args[2] if len(args) >= 3 else None
             if isinstance(push_data, dict):
+                if self._api.config_entry_id:
+                    push_data["config_entry_id"] = self._api.config_entry_id
                 evt = push_data.get("EventMessage")
                 if evt == "DomofonCalling":
                     self._api.set_active_call(

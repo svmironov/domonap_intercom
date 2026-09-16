@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from .const import EVENT_CALL_ENDED
 from .external_sip_signaling import AsteriskSipAccount, ExternalSipConfig, parse_host_port
 from .panel_sip import RubetekPanelSipCall
+from .relay import open_relay, raise_for_relay_error
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -170,31 +171,29 @@ class PanelCallController:
         there is no established external dialog, the Panel API performs the
         APK-style silent answer before opening the relay.
         """
-        if self.external_call_established:
-            return await self._open_panel_relay_only(door_id)
-        return await self._api.open_relay_by_door_id(door_id)
+        return await self._api.open_relay_by_door_id(
+            door_id, answer_before_open=not self.external_call_established
+        )
 
     async def open_door_by_key_id(self, key_id: str) -> Any:
-        if not self.external_call_established:
-            answer = getattr(self._api, "_answer_active_sip_before_open", None)
-            if callable(answer):
-                try:
-                    await answer()
-                except Exception:
-                    _LOGGER.debug("Panel SIP pre-answer failed", exc_info=True)
-        return await self._api.open_relay_by_key_id(key_id)
+        return await self._api.open_relay_by_key_id(
+            key_id, answer_before_open=not self.external_call_established
+        )
 
     def should_end_after_relay(self) -> bool:
         """Door opening always ends the call, matching the panel APK."""
         return True
 
-    async def end_call(self, *, source: str = "manual") -> dict[str, Any] | None:
+    async def end_call(self, *, source: str = "manual", expected_call_id: str | None = None) -> dict[str, Any] | None:
         """Terminate every active call dialog without touching the relay.
 
         Used by the silence/reject services: the Domonap SIP session and the
         optional external Asterisk dialog are ended together, exactly like the
         relay flow does after opening a door.
         """
+        current = getattr(self._api, "active_call_id", None) or self._active_call_id
+        if expected_call_id and current != expected_call_id:
+            return {"ok": True, "skipped": True, "reason": "call_replaced"}
         return await self._end_call_dialogs(source=source, end_external=True)
 
     async def end_after_relay(self, *, source: str = "relay") -> dict[str, Any] | None:
@@ -217,6 +216,7 @@ class PanelCallController:
         except asyncio.CancelledError:
             raise
         except Exception:
+            self._api.runtime_status.failed("external_sip", "forward_failed")
             _LOGGER.warning("Cannot start external SIP forwarding", exc_info=True)
             await self._end_call_dialogs(
                 source="external_sip_forward_failure", end_external=False
@@ -231,23 +231,14 @@ class PanelCallController:
             _LOGGER.warning("DTMF 1 received but active Domonap door is unknown")
             return
         try:
-            result = await self._open_panel_relay_only(door_id)
+            result = await open_relay(
+                self._hass, self._api, self, door_id,
+                by_door=True, source="external_sip_dtmf_1",
+            )
+            raise_for_relay_error(result)
         except Exception:
+            self._api.runtime_status.failed("external_sip", "relay_open_failed")
             _LOGGER.exception("Failed to open Domonap relay on external SIP DTMF 1")
-            return
-        if not (isinstance(result, dict) and result.get("ok") is True):
-            _LOGGER.error("External SIP DTMF 1 relay opening failed: %s", result)
-            return
-
-        _LOGGER.info(
-            "Door %s opened by external SIP DTMF 1; ending the call",
-            door_id,
-        )
-        end_result = await self._end_call_dialogs(
-            source="external_sip_dtmf_1", end_external=True
-        )
-        if isinstance(end_result, dict) and not end_result.get("ok", False):
-            _LOGGER.warning("Call teardown after DTMF 1 was incomplete: %s", end_result)
 
     async def _on_external_hangup(self) -> None:
         _LOGGER.info("External SIP call ended; terminating the Domonap call")
@@ -287,11 +278,10 @@ class PanelCallController:
             while True:
                 await asyncio.sleep(self._call_timer_tick)
                 if self._active_call_id is None and not self.external_call_active:
-                    # No call in flight: nothing to time out. A later incoming
-                    # push restarts the timer through _start_call_timer().
-                    self._call_deadline = None
-                    self._call_timer_restarted_on_answer = False
-                    continue
+                    # Stop polling while idle; the next incoming push starts
+                    # a fresh task through _start_call_timer().
+                    self._cancel_call_timer()
+                    return
 
                 if (
                     self.external_call_established
@@ -453,39 +443,6 @@ class PanelCallController:
             # while this teardown was still running.
             if self._active_call_id in (None, call_id):
                 self._cancel_call_timer()
-
-    async def _open_panel_relay_only(self, door_id: str) -> Any:
-        """Resolve DoorId -> KeyId without changing either SIP dialog."""
-        keys_response = await self._api.get_paged_keys()
-        if not isinstance(keys_response, dict):
-            return {
-                "ok": False,
-                "error": "Unexpected key list response",
-                "body": str(keys_response),
-            }
-        if "error" in keys_response:
-            return keys_response
-
-        wanted = str(door_id)
-        for key in keys_response.get("results", []):
-            if not isinstance(key, dict) or str(key.get("doorId", "")) != wanted:
-                continue
-            key_id = key.get("id")
-            if not key_id:
-                return {
-                    "ok": False,
-                    "error": "Door key has no id",
-                    "door_id": wanted,
-                }
-            _LOGGER.debug(
-                "External-call relay DoorId=%s resolved to KeyId=%s", wanted, key_id
-            )
-            return await self._api.open_relay_by_key_id(str(key_id))
-        return {
-            "ok": False,
-            "error": "No panel key found for DoorId",
-            "door_id": wanted,
-        }
 
     @staticmethod
     def _string_value(value: Any) -> str | None:

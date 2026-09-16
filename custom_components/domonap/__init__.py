@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from secrets import token_urlsafe
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 
 from homeassistant.components import persistent_notification
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .const import (
     DOMAIN,
@@ -39,9 +40,6 @@ from .const import (
     CALL_END_MODE_ANSWER,
 )
 
-if TYPE_CHECKING:
-    from .api import IntercomAPI
-
 _LOGGER = logging.getLogger(__name__)
 
 REAUTH_NOTIFICATION_TITLE = "Domonap: требуется повторная авторизация"
@@ -69,7 +67,11 @@ def _dismiss_reauth_notification(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    await hass.config_entries.async_reload(entry.entry_id)
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+    # Token refresh updates entry.data too; it must not restart connections or
+    # re-fetch the startup-only door list.
+    if runtime.get("options") != dict(entry.options):
+        await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -96,7 +98,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from .panel_api import RubetekPanelIntercomAPI
     from .panel_runtime_consumer import RubetekPanelRuntimeConsumer
     from .panel_call_controller import PanelCallController
-    from .util import migrate_panel_entity_unique_ids
+    from .util import migrate_panel_entity_unique_ids, migrate_device_identifiers
 
     hass.data[DOMAIN].setdefault(entry.entry_id, {})
 
@@ -126,6 +128,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             instance_id=entry.data.get(PARAM_INSTANCE_ID),
         )
 
+    api.config_entry_id = entry.entry_id
     new_data = dict(entry.data)
     if not new_data.get(PARAM_WEBRTC_PROXY_SECRET):
         new_data[PARAM_WEBRTC_PROXY_SECRET] = token_urlsafe(24)
@@ -150,6 +153,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # multiple Rubetek accounts legal in Home Assistant.
     if auth_mode == AUTH_MODE_PANEL:
         migrate_panel_entity_unique_ids(hass, entry)
+
+    migrate_device_identifiers(hass, entry)
 
     api.set_tokens(
         new_data.get(PARAM_ACCESS_TOKEN),
@@ -205,6 +210,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryAuthFailed(REAUTH_NOTIFICATION_MESSAGE)
     _dismiss_reauth_notification(hass, entry)
 
+    try:
+        keys = await api.get_keys()
+        if "error" in keys:
+            raise ConfigEntryNotReady("Could not load Domonap doors")
+    except Exception as err:
+        await api.close()
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        if api._refresh_token_invalid:
+            raise ConfigEntryAuthFailed(REAUTH_NOTIFICATION_MESSAGE) from err
+        raise ConfigEntryNotReady("Could not load Domonap doors") from err
+
     call_controller = None
     if auth_mode == AUTH_MODE_PANEL:
         options = entry.options
@@ -226,6 +242,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:
             # External SIP is optional.  Keep cameras, relay actions and SignalR
             # available even when Asterisk is temporarily unreachable.
+            api.runtime_status.failed("external_sip", "start_failed")
             _LOGGER.warning("External SIP controller failed to start", exc_info=True)
         hass.data[DOMAIN][entry.entry_id][CALL_CONTROLLER] = call_controller
 
@@ -245,26 +262,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             new_data.get(PARAM_WEBRTC_PROXY_SECRET),
         )
 
+    hass.data[DOMAIN][entry.entry_id]["options"] = dict(entry.options)
     hass.data[DOMAIN][entry.entry_id][API] = api
     hass.data[DOMAIN][entry.entry_id]["notify_consumer"] = consumer
 
-    setup_complete = True
-    entry.async_create_background_task(hass, consumer.start(), "domonap_notify")
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except (Exception, asyncio.CancelledError):
+        if await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+            await _async_close_runtime(hass, entry)
+        raise
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    setup_complete = True
+    hass.data[DOMAIN][entry.entry_id]["notify_task"] = entry.async_create_background_task(
+        hass, consumer.start(), "domonap_notify"
+    )
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    stored = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unloaded:
+        return False
 
+    await _async_close_runtime(hass, entry)
+    return True
+
+
+async def _async_close_runtime(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    stored = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
     consumer = stored.get("notify_consumer")
     if consumer:
         try:
             await consumer.stop()
         except Exception:
             _LOGGER.debug("Exception while stopping notify consumer", exc_info=True)
+
+    task = stored.get("notify_task")
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     controller = stored.get(CALL_CONTROLLER)
     if controller:
@@ -273,10 +311,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:
             _LOGGER.debug("Exception while stopping call controller", exc_info=True)
 
-    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
     api = stored.get(API)
     if api:
+        media_proxy = hass.data[DOMAIN].get(MEDIA_PROXY)
+        if media_proxy is not None:
+            media_proxy.unregister_api(api)
+        proxy = hass.data[DOMAIN].get(WEBRTC_PROXY)
+        if proxy is not None:
+            await proxy.close_for_api(api)
         try:
             await api.close()
         except Exception:
@@ -284,12 +326,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
 
-    remaining_entries = [
-        key for key in hass.data.get(DOMAIN, {}) if key != WEBRTC_PROXY
-    ]
-    if not remaining_entries:
-        from .actions import async_unload_actions
-
-        await async_unload_actions(hass)
-
-    return unloaded
+    # Services and proxy views are domain-wide, registered by async_setup.
+    # Keep them available for a subsequent entry reload/addition.

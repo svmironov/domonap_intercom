@@ -223,6 +223,24 @@ class PanelRuntimeConsumerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PanelCallTimerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_timer_stops_and_next_call_starts_a_new_task(self):
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        controller = PanelCallController(
+            FakeHass(), api, config_entry_id="entry-1", enabled=False,
+            call_timer_seconds=0.3,
+        )
+        controller.on_incoming_call({})
+        idle_task = controller._call_timer_task
+        try:
+            await asyncio.wait_for(asyncio.shield(idle_task), timeout=0.3)
+            self.assertIsNone(controller._call_timer_task)
+            self.assertIsNone(controller._call_deadline)
+            controller.on_incoming_call({"CallId": "call-new"})
+            self.assertIsNot(controller._call_timer_task, idle_task)
+            self.assertFalse(controller._call_timer_task.done())
+        finally:
+            await controller.stop()
+
     async def test_call_timer_ends_call_after_deadline(self):
         """EndCallTimer caps an unanswered call at the configured limit."""
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
@@ -315,6 +333,50 @@ class PanelCallTimerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ended, [])
 
 
+class RelayAnswerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_relay_answers_once_and_preserves_established_external_call(self):
+        for by_door in (True, False):
+            for established in (True, False):
+                for answer_ok in (True, False):
+                    with self.subTest(by_door=by_door, established=established, answer_ok=answer_ok):
+                        events = []
+                        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+                        api.set_active_call("call-1")
+
+                        async def answer(timeout=2.0):
+                            events.append("answer")
+                            return {"ok": answer_ok}
+
+                        async def get_keys():
+                            events.append("keys")
+                            return {"results": [{"id": "key-1", "doorId": "door-1"}]}
+
+                        async def post(path, payload, **kwargs):
+                            events.append((path, payload))
+                            return ""
+
+                        api._active_sip_call = SimpleNamespace(answer=answer)
+                        api.get_keys = get_keys
+                        api._post = post
+                        controller = PanelCallController(
+                            FakeHass(), api, config_entry_id="entry-1", enabled=False
+                        )
+                        controller._account = SimpleNamespace(
+                            active_call=SimpleNamespace(established=established)
+                        )
+                        if by_door:
+                            result = await controller.open_door_by_door_id("door-1")
+                        else:
+                            result = await controller.open_door_by_key_id("key-1")
+
+                        expected = [] if established else ["answer"]
+                        if by_door:
+                            expected.append("keys")
+                        expected.append(("/client-api/Device/OpenRelayByKeyId", {"keyId": "key-1"}))
+                        self.assertTrue(result["ok"])
+                        self.assertEqual(events, expected)
+
+
 class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
     def _setup_runtime(self, hass, api, controller):
         hass.data["domonap"] = {
@@ -401,7 +463,7 @@ class SilenceRejectServiceTests(unittest.IsolatedAsyncioTestCase):
         class EstablishedController:
             external_call_established = True
 
-            async def end_call(self, *, source):
+            async def end_call(self, *, source, expected_call_id=None):
                 return {"ok": True, "source": source}
 
         controller = EstablishedController()

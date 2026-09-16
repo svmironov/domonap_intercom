@@ -83,6 +83,7 @@ class RubetekPanelNotifyConsumer:
             except asyncio.CancelledError:
                 raise
             except aiohttp.WSServerHandshakeError as err:
+                self._api.runtime_status.failed("signalr", f"HTTP {err.status}")
                 if err.status == 401 and self._api.refresh_token:
                     _LOGGER.info("Panel SignalR token rejected; refreshing session")
                     try:
@@ -99,6 +100,7 @@ class RubetekPanelNotifyConsumer:
                         err,
                     )
             except Exception as err:
+                self._api.runtime_status.failed("signalr", type(err).__name__)
                 _LOGGER.warning(
                     "Panel SignalR error: %s: %s", type(err).__name__, err
                 )
@@ -166,6 +168,7 @@ class RubetekPanelNotifyConsumer:
         except (asyncio.TimeoutError, aiohttp.ServerTimeoutError) as err:
             if not handshake_completed:
                 raise
+            self._api.runtime_status.failed("signalr", "timeout")
             _LOGGER.warning("Panel SignalR server timeout: %s", err)
         finally:
             self._connected = False
@@ -277,6 +280,7 @@ class RubetekPanelNotifyConsumer:
             )
 
     async def _handle_invocation(self, data: dict[str, Any]) -> None:
+        self._api.runtime_status.event_received()
         target = data.get("target")
         args: Iterable[Any] = data.get("arguments") or []
         args = list(args)

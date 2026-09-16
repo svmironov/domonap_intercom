@@ -58,9 +58,9 @@ def event_belongs_to_entry(
     expose the same DoorId.
     """
     source_entry_id = event_data.get("config_entry_id")
-    if panel_scoped:
+    if source_entry_id is not None:
         return source_entry_id == entry_id
-    return source_entry_id is None
+    return not panel_scoped
 
 
 def migrate_panel_entity_unique_ids(hass, entry: ConfigEntry) -> None:
@@ -93,3 +93,52 @@ def migrate_panel_entity_unique_ids(hass, entry: ConfigEntry) -> None:
                 entity.unique_id,
                 new_unique_id,
             )
+
+
+def find_last_call_sensor_entity_id(hass, entry_id: str) -> str | None:
+    """Resolve a renamed sensor only within the selected account's registry."""
+    entry = hass.config_entries.async_get_entry(entry_id)
+    if entry is None:
+        return None
+    raw = f"{extract_phone_digits(entry) or entry_id}_last_call_door_id"
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, scoped_entity_unique_id(entry, raw))
+    entity = registry.async_get(entity_id) if entity_id else None
+    if entity is not None and entity.config_entry_id == entry_id:
+        return entity_id
+    return None
+
+
+def scoped_device_id(entry_id: str | None, raw_id: str) -> str:
+    """Keep device identity separate even when accounts share the same door."""
+    return f"entry:{entry_id}:{raw_id}" if entry_id else str(raw_id)
+
+
+def migrate_device_identifiers(hass, entry: ConfigEntry) -> None:
+    """Preserve sole-owner devices; split historically shared devices per account."""
+    from homeassistant.helpers import device_registry as dr
+
+    devices = dr.async_get(hass)
+    entities = er.async_get(hass)
+    prefix = f"entry:{entry.entry_id}:"
+    for device in dr.async_entries_for_config_entry(devices, entry.entry_id):
+        legacy = {(domain, value) for domain, value in device.identifiers
+                  if domain == DOMAIN and not value.startswith("entry:")}
+        if not legacy:
+            continue
+        scoped = {(DOMAIN, prefix + value) for _, value in legacy}
+        if device.config_entries == {entry.entry_id}:
+            devices.async_update_device(device.id, new_identifiers=(device.identifiers - legacy) | scoped)
+            continue
+        replacement = devices.async_get_or_create(
+            config_entry_id=entry.entry_id, identifiers=scoped,
+            name=device.name, manufacturer=device.manufacturer, model=device.model,
+        )
+        devices.async_update_device(
+            replacement.id, area_id=device.area_id, name_by_user=device.name_by_user,
+            labels=device.labels, disabled_by=device.disabled_by,
+        )
+        for entity in er.async_entries_for_config_entry(entities, entry.entry_id):
+            if entity.device_id == device.id and entity.platform == DOMAIN:
+                entities.async_update_entity(entity.entity_id, device_id=replacement.id)
+        devices.async_update_device(device.id, remove_config_entry_id=entry.entry_id)

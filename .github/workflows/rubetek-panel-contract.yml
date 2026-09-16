@@ -14,9 +14,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - name: Install test dependencies
-        run: python -m pip install aiohttp
+        run: python -m pip install homeassistant==2025.3.4 numpy av ha-ffmpeg
       - name: Compile integration
         run: python -m compileall -q custom_components/domonap
       - name: Run panel API contract tests
@@ -25,3 +25,10 @@ jobs:
         run: python test/test_external_sip.py -v
       - name: Run panel SIP lifecycle tests
         run: python test/test_panel_sip_lifecycle.py -v
+
+      - name: Run panel call flow tests
+        run: python test/test_panel_call_flow.py -v
+      - name: Run runtime reliability tests
+        run: python test/test_runtime_reliability.py -v
+      - name: Run media lifecycle tests
+        run: python test/test_media_lifecycle.py -v

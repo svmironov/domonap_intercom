@@ -52,6 +52,11 @@ class DomonapMediaProxy:
         )
         return self.get_proxy_url(proxy_secret, token)
 
+    def unregister_api(self, api) -> None:
+        for key, target in list(self._targets.items()):
+            if target.api is api:
+                self._targets.pop(key, None)
+
     def get_proxy_path(self, proxy_secret: str, token: str) -> str:
         return f"/api/{DOMAIN}/media_proxy/{proxy_secret}/{token}"
 
