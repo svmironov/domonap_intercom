@@ -157,6 +157,12 @@ class IntercomOpenLastCallDoor(ButtonEntity):
                 res = await self._api.open_relay_by_door_id(door_id)
             if not (isinstance(res, dict) and res.get("ok") is True):
                 _LOGGER.error("Failed to open relay by last call door_id=%s: %s", door_id, res)
+                # The call may already be answered (mute-before-open); a failed
+                # relay must not leave it hanging without a door behind it.
+                if self._controller is not None:
+                    await self._controller.end_call(source="relay_open_failed")
+                else:
+                    await _end_active_call(self.hass, self._api)
                 return
 
             await _finish_after_relay(self.hass, self._api, self._controller)
@@ -205,7 +211,6 @@ class IntercomDoor(ButtonEntity):
             "name": self._name,
             "manufacturer": "Domonap",
             "model": "Intercom Device",
-            "via_device": (DOMAIN, self._key_id),
         }
 
     async def async_press(self):
@@ -216,6 +221,12 @@ class IntercomDoor(ButtonEntity):
                 response = await self._api.open_relay_by_key_id(self._key_id)
             if response.get("ok") is not True:
                 _LOGGER.error("Failed to open the door %s. Response: %s", self._name, response)
+                # The call may already be answered (mute-before-open); a failed
+                # relay must not leave it hanging without a door behind it.
+                if self._controller is not None:
+                    await self._controller.end_call(source="relay_open_failed")
+                else:
+                    await _end_active_call(self.hass, self._api)
                 return
             await _finish_after_relay(self.hass, self._api, self._controller)
         except Exception as e:

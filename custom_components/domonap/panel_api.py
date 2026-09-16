@@ -289,25 +289,6 @@ class RubetekPanelIntercomAPI(IntercomAPI):
         self._active_sip_call_id = call_id or self._active_call_id
         self._active_sip_call.start()
 
-    async def _answer_active_sip_before_open(self) -> Dict[str, Any] | None:
-        """Answer the ringing SIP leg before opening, matching the panel APK."""
-        sip_call = self._active_sip_call
-        if not self._active_call_id or not isinstance(sip_call, RubetekPanelSipCall):
-            return None
-        try:
-            result = await sip_call.answer(timeout=2.0)
-        except Exception as err:
-            _LOGGER.warning("Panel SIP answer before relay opening failed: %s", err)
-            return {"ok": False, "error": str(err)}
-        if not (isinstance(result, dict) and result.get("ok") is True):
-            _LOGGER.warning("Panel SIP answer before relay opening failed: %s", result)
-        else:
-            _LOGGER.info(
-                "Panel SIP call %s answered before relay opening",
-                self._active_call_id,
-            )
-        return result
-
     async def open_relay_by_door_id(self, door_id: str):
         """Open a panel relay by resolving DoorId to the user's KeyId first.
 
@@ -445,25 +426,46 @@ class RubetekPanelIntercomAPI(IntercomAPI):
                 _LOGGER.warning("Panel SIP session destruction failed: %s", err)
                 return {"ok": False, "error": str(err)}
 
-    async def end_active_call(self) -> Dict[str, Any] | None:
-        """End the Panel call using the APK order: REST in parallel with SIP destroy."""
+    async def end_active_call(
+        self, expected_call_id: Optional[str] = None
+    ) -> Dict[str, Any] | None:
+        """End the Panel call the way CallOrchestrator.endCallSmart() does.
+
+        The APK posts NotifyCallEnded only while the temporary SIP account is
+        not registered (sipRegState != Ok): REST is the fallback for a call that
+        cannot be terminated over SIP. A registered session signals the end
+        through BYE/reject inside ``destroy()`` and skips the REST notification.
+
+        ``expected_call_id`` guards against overlapping calls: when a newer
+        call already replaced the active one, nothing is torn down.
+        """
         async with self._active_call_lock:
             call_id = self._active_call_id
             if not call_id:
                 return None
+            if expected_call_id is not None and call_id != expected_call_id:
+                _LOGGER.debug(
+                    "Active call moved from %s to %s; skipping stale teardown",
+                    expected_call_id,
+                    call_id,
+                )
+                return {"ok": True, "skipped": True, "reason": "call_replaced"}
 
             sip_call = self._active_sip_call
+            sip_registered = bool(getattr(sip_call, "registered", False))
             sip_expected = sip_call is not None and bool(
                 getattr(sip_call, "has_invite", False)
             )
 
-            # The APK launches notifyCallEnded in an IO coroutine and immediately
-            # continues with SIP hangup/destroy. Do the same: backend latency must
-            # never delay terminating the ringing/established SIP session.
-            notify_task = asyncio.create_task(
-                self._safe_notify_call_ended(call_id),
-                name="domonap_panel_notify_call_ended",
-            )
+            # CallOrchestrator launches notifyCallEnded in an IO coroutine and
+            # immediately continues with SIP hangup/destroy. Mirror that: the
+            # REST fallback must never delay terminating the SIP session.
+            notify_task: Optional[asyncio.Task] = None
+            if sip_call is None or not sip_registered:
+                notify_task = asyncio.create_task(
+                    self._safe_notify_call_ended(call_id),
+                    name="domonap_panel_notify_call_ended",
+                )
 
             if sip_call is not None:
                 try:
@@ -482,9 +484,17 @@ class RubetekPanelIntercomAPI(IntercomAPI):
             else:
                 sip_result = None
 
-            # notifyCallEnded was already running while the SIP teardown happened.
-            # Keep its result for diagnostics, but never use it to delay SIP start.
-            notify_result = await notify_task
+            # notifyCallEnded was only launched for an unregistered session.
+            # Keep its result for diagnostics, but never use it to delay SIP
+            # teardown.
+            if notify_task is not None:
+                notify_result = await notify_task
+            else:
+                notify_result = {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "sip_registered",
+                }
 
             notify_ok = (
                 isinstance(notify_result, dict)
@@ -493,9 +503,14 @@ class RubetekPanelIntercomAPI(IntercomAPI):
             sip_ok = isinstance(sip_result, dict) and sip_result.get("ok") is True
             ok = sip_ok if sip_expected else (sip_ok or notify_ok)
 
-            self._active_sip_call = None
-            self._active_sip_call_id = None
-            self._active_call_id = None
+            # A new call may have replaced this session while the teardown was
+            # running (double ring, call waiting). Only clear the state that
+            # still belongs to the call being ended.
+            if self._active_call_id == call_id:
+                self._active_call_id = None
+            if self._active_sip_call is sip_call:
+                self._active_sip_call = None
+                self._active_sip_call_id = None
 
             return {
                 "ok": ok,

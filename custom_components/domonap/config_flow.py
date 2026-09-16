@@ -34,6 +34,9 @@ from .const import (
     OPT_EXTERNAL_SIP_TRANSPORT,
     OPT_EXTERNAL_SIP_CALL_NUMBER,
     EXTERNAL_SIP_TRANSPORT_UDP,
+    OPT_CALL_END_MODE,
+    CALL_END_MODE_ANSWER,
+    CALL_END_MODE_REJECT,
 )
 from .api import IntercomAPI, is_android_guid
 from .external_sip_signaling import parse_host_port
@@ -327,14 +330,15 @@ class IntercomOptionsFlow(config_entries.OptionsFlow):
         self._config_entry = config_entry
 
     async def async_step_init(self, user_input=None):
-        if self._config_entry.data.get(PARAM_AUTH_MODE, AUTH_MODE_PHONE) != AUTH_MODE_PANEL:
-            return self.async_abort(reason="external_sip_panel_only")
-
+        is_panel = (
+            self._config_entry.data.get(PARAM_AUTH_MODE, AUTH_MODE_PHONE)
+            == AUTH_MODE_PANEL
+        )
         options = self._config_entry.options
         errors = {}
         if user_input is not None:
             enabled = bool(user_input.get(OPT_EXTERNAL_SIP_ENABLED, False))
-            if enabled:
+            if is_panel and enabled:
                 if not user_input.get(OPT_EXTERNAL_SIP_USER, "").strip():
                     errors["base"] = "external_sip_user_required"
                 elif not user_input.get(OPT_EXTERNAL_SIP_DOMAIN, "").strip():
@@ -349,38 +353,45 @@ class IntercomOptionsFlow(config_entries.OptionsFlow):
             if not errors:
                 return self.async_create_entry(title="", data=dict(user_input))
 
-        schema = vol.Schema(
-            {
-                vol.Required(
-                    OPT_EXTERNAL_SIP_ENABLED,
-                    default=options.get(OPT_EXTERNAL_SIP_ENABLED, False),
-                ): bool,
-                vol.Optional(
-                    OPT_EXTERNAL_SIP_USER,
-                    default=options.get(OPT_EXTERNAL_SIP_USER, ""),
-                ): str,
-                vol.Optional(
-                    OPT_EXTERNAL_SIP_PASSWORD,
-                    default=options.get(OPT_EXTERNAL_SIP_PASSWORD, ""),
-                ): str,
-                vol.Optional(
-                    OPT_EXTERNAL_SIP_DOMAIN,
-                    default=options.get(OPT_EXTERNAL_SIP_DOMAIN, ""),
-                ): str,
-                vol.Optional(
-                    OPT_EXTERNAL_SIP_TRANSPORT,
-                    default=options.get(
-                        OPT_EXTERNAL_SIP_TRANSPORT, EXTERNAL_SIP_TRANSPORT_UDP
-                    ),
-                ): vol.In([EXTERNAL_SIP_TRANSPORT_UDP]),
-                vol.Optional(
-                    OPT_EXTERNAL_SIP_CALL_NUMBER,
-                    default=options.get(OPT_EXTERNAL_SIP_CALL_NUMBER, ""),
-                ): str,
-            }
-        )
+        schema = {
+            vol.Required(
+                OPT_CALL_END_MODE,
+                default=options.get(OPT_CALL_END_MODE, CALL_END_MODE_ANSWER),
+            ): vol.In([CALL_END_MODE_ANSWER, CALL_END_MODE_REJECT]),
+        }
+        if is_panel:
+            schema.update(
+                {
+                    vol.Required(
+                        OPT_EXTERNAL_SIP_ENABLED,
+                        default=options.get(OPT_EXTERNAL_SIP_ENABLED, False),
+                    ): bool,
+                    vol.Optional(
+                        OPT_EXTERNAL_SIP_USER,
+                        default=options.get(OPT_EXTERNAL_SIP_USER, ""),
+                    ): str,
+                    vol.Optional(
+                        OPT_EXTERNAL_SIP_PASSWORD,
+                        default=options.get(OPT_EXTERNAL_SIP_PASSWORD, ""),
+                    ): str,
+                    vol.Optional(
+                        OPT_EXTERNAL_SIP_DOMAIN,
+                        default=options.get(OPT_EXTERNAL_SIP_DOMAIN, ""),
+                    ): str,
+                    vol.Optional(
+                        OPT_EXTERNAL_SIP_TRANSPORT,
+                        default=options.get(
+                            OPT_EXTERNAL_SIP_TRANSPORT, EXTERNAL_SIP_TRANSPORT_UDP
+                        ),
+                    ): vol.In([EXTERNAL_SIP_TRANSPORT_UDP]),
+                    vol.Optional(
+                        OPT_EXTERNAL_SIP_CALL_NUMBER,
+                        default=options.get(OPT_EXTERNAL_SIP_CALL_NUMBER, ""),
+                    ): str,
+                }
+            )
         return self.async_show_form(
             step_id="init",
-            data_schema=schema,
+            data_schema=vol.Schema(schema),
             errors=errors,
         )

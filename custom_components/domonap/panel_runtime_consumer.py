@@ -39,17 +39,51 @@ class RubetekPanelRuntimeConsumer(RubetekPanelNotifyConsumer):
                     self._api.start_active_sip_call(push_data)
                     if self._call_controller is not None:
                         self._call_controller.on_incoming_call(push_data)
+                elif event_message == "DomofonCallAnswered":
+                    # Another resident answered the forked call. The APK runs
+                    # endCallSmart() unless this device accepted the call itself
+                    # (onCallAnsweredPush + isCallAccepted). The equivalent of a
+                    # locally accepted call is an established external SIP dialog.
+                    established = bool(
+                        self._call_controller is not None
+                        and self._call_controller.external_call_established
+                    )
+                    if not established:
+                        if self._call_controller is not None:
+                            await self._call_controller.on_panel_call_ended(call_id)
+                        await self._destroy_panel_call(
+                            call_id, reason="signalr_call_answered_elsewhere"
+                        )
                 elif event_message == "DomofonCallEnded":
                     if self._call_controller is not None:
                         await self._call_controller.on_panel_call_ended(call_id)
-                    destroy = getattr(self._api, "destroy_active_sip_session", None)
-                    if callable(destroy):
-                        await destroy(
-                            call_id,
-                            reason="signalr_call_ended",
-                            terminate_dialog=True,
-                        )
-                    else:
-                        self._api.clear_active_call(call_id)
+                    await self._destroy_panel_call(
+                        call_id, reason="signalr_call_ended"
+                    )
 
         await super()._handle_invocation(data)
+
+    async def _destroy_panel_call(self, call_id, *, reason: str) -> None:
+        """Destroy the panel SIP session with the endCallSmart() REST fallback."""
+        api = self._api
+        sip_call = getattr(api, "_active_sip_call", None)
+        sip_registered = bool(getattr(sip_call, "registered", False))
+
+        destroy = getattr(api, "destroy_active_sip_session", None)
+        result = None
+        if callable(destroy):
+            result = await destroy(call_id, reason=reason, terminate_dialog=True)
+        else:
+            api.clear_active_call(call_id)
+
+        # destroy was skipped because the session belongs to a newer call.
+        if result is None:
+            return
+
+        # CallOrchestrator.endCallSmart() posts NotifyCallEnded while the
+        # temporary SIP account is not registered: REST is then the only
+        # end-of-call signal the backend receives.
+        if not sip_registered and call_id:
+            safe_notify = getattr(api, "_safe_notify_call_ended", None)
+            if callable(safe_notify):
+                await safe_notify(str(call_id))

@@ -345,6 +345,18 @@ class RubetekPanelNotifyConsumer:
     async def _prepare_incoming_call_event(self, push_data: dict[str, Any]) -> None:
         """Normalize media fields to the same event contract as phone mode."""
         call_id = str(push_data.get("CallId", ""))
+
+        # The APK DomofonPush carries WebrtcVideoUrl and uses it as the live
+        # WHEP preview of the incoming call. Keep the original value and add
+        # the camelCase alias used by key/camera payloads.
+        webrtc_video_url = (
+            push_data.get("WebrtcVideoUrl") or push_data.get("webrtcVideoUrl")
+        )
+        if webrtc_video_url:
+            push_data.setdefault("OriginalWebrtcVideoUrl", webrtc_video_url)
+            push_data["WebrtcVideoUrl"] = webrtc_video_url
+            push_data["webrtcVideoUrl"] = webrtc_video_url
+
         video_preview = push_data.get("VideoPreview") or push_data.get("videoPreview")
         proxied_video_preview = self._proxied_media_url(video_preview)
         if video_preview:

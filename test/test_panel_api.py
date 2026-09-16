@@ -28,7 +28,7 @@ def load_module(name: str, filename: str):
 
 
 load_module("custom_components.domonap.sip", "sip.py")
-load_module("custom_components.domonap.api", "api.py")
+api_module = load_module("custom_components.domonap.api", "api.py")
 panel_api = load_module("custom_components.domonap.panel_api", "panel_api.py")
 RubetekPanelIntercomAPI = panel_api.RubetekPanelIntercomAPI
 
@@ -138,6 +138,163 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["ok"], False)
         self.assertEqual(opened, [])
 
+    async def test_phone_open_by_door_id_answers_sip_before_relay(self):
+        """The phone profile mutes the panel the same way the app does.
+
+        The base IntercomAPI answers its SIP session before the relay REST
+        call: 200 OK wins the forked call, the panel stops ringing, and no
+        media ever flows through Home Assistant.
+        """
+        api = api_module.IntercomAPI(
+            device_token="0123456789abcdef0123456789abcdef",
+            instance_id="0123456789abcdef",
+        )
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True, "method": "sip_answer"}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_post(path, payload=None, **kwargs):
+            events.append(("open", path, payload))
+            return ""
+
+        api._post = fake_post
+
+        result = await api.open_relay_by_door_id("door-9")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["answer", ("open", "/client-api/Device/OpenRelayByDoorId", {"doorId": "door-9"})])
+
+    async def test_phone_open_by_key_id_answers_sip_before_relay(self):
+        api = api_module.IntercomAPI(
+            device_token="0123456789abcdef0123456789abcdef",
+            instance_id="0123456789abcdef",
+        )
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True, "method": "sip_answer"}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_post(path, payload=None, **kwargs):
+            events.append(("open", path))
+            return ""
+
+        api._post = fake_post
+
+        result = await api.open_relay_by_key_id("key-9")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["answer", ("open", "/client-api/Device/OpenRelayByKeyId")])
+
+    async def test_phone_open_relay_without_active_call_skips_answer(self):
+        """No incoming call: the relay must open without touching SIP."""
+        api = api_module.IntercomAPI(
+            device_token="0123456789abcdef0123456789abcdef",
+            instance_id="0123456789abcdef",
+        )
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_post(path, payload=None, **kwargs):
+            events.append("open")
+            return ""
+
+        api._post = fake_post
+
+        result = await api.open_relay_by_door_id("door-9")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["open"])
+
+    async def test_panel_end_active_call_skips_stale_call_id(self):
+        """A teardown for an old call must not touch the replacement call."""
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-new")
+        destroyed = []
+
+        class FakeSipCall:
+            has_invite = True
+            registered = True
+
+            async def destroy(self, **kwargs):
+                destroyed.append("destroy")
+                return {"ok": True, "method": "sip_destroy"}
+
+        sip_call = FakeSipCall()
+        api._active_sip_call = sip_call
+
+        result = await api.end_active_call(expected_call_id="call-old")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "call_replaced")
+        self.assertEqual(destroyed, [])
+        self.assertEqual(api.active_call_id, "call-new")
+        self.assertIs(api._active_sip_call, sip_call)
+
+    async def test_reject_mode_skips_answer_before_relay(self):
+        """call_end_mode=reject opens the door without accepting the call."""
+        api = api_module.IntercomAPI(
+            device_token="0123456789abcdef0123456789abcdef",
+            instance_id="0123456789abcdef",
+        )
+        api.call_end_mode = "reject"
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True}
+
+        api._active_sip_call = FakeSipCall()
+
+        async def fake_post(path, payload=None, **kwargs):
+            events.append("open")
+            return ""
+
+        api._post = fake_post
+
+        result = await api.open_relay_by_door_id("door-9")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["open"])
+
+    async def test_reject_mode_still_allows_forced_answer(self):
+        """The silence service forces the answer regardless of the mode."""
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.call_end_mode = "reject"
+        api.set_active_call("call-123")
+        events = []
+
+        class FakeSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True}
+
+        api._active_sip_call = FakeSipCall()
+
+        result = await api._answer_active_sip_before_open(force=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["answer"])
+
     async def test_panel_notify_call_ended_matches_apk_contract(self):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         calls = []
@@ -155,7 +312,40 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(calls[0][2]["need_auth"])
         self.assertEqual(calls[0][2]["expect"], "text")
 
-    async def test_panel_end_active_call_notifies_backend_even_when_sip_succeeds(self):
+    async def test_panel_open_by_door_id_answers_sip_before_relay(self):
+        """The panel goes silent when the call is answered BEFORE the relay opens.
+
+        CallOrchestrator.openDoorSilentlyAndEndCall() runs answer() first: the
+        SIP 200 OK wins the forked call and stops the intercom from ringing.
+        """
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-123")
+        events = []
+
+        class FakePanelSipCall:
+            async def answer(self, timeout=2.0, **kwargs):
+                events.append("answer")
+                return {"ok": True, "method": "sip_answer"}
+
+        api._active_sip_call = FakePanelSipCall()
+
+        async def fake_get_paged_keys(*args, **kwargs):
+            return {"results": [{"id": "key-1", "doorId": "door-1"}]}
+
+        async def fake_open_by_key_id(key_id):
+            events.append("open")
+            return {"ok": True, "body": ""}
+
+        api.get_paged_keys = fake_get_paged_keys
+        api.open_relay_by_key_id = fake_open_by_key_id
+
+        result = await api.open_relay_by_door_id("door-1")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["answer", "open"])
+
+    async def test_panel_end_active_call_skips_notify_when_sip_registered(self):
+        """endCallSmart() posts NotifyCallEnded only when sipRegState != Ok."""
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         api.set_active_call("call-123")
         notified = []
@@ -164,11 +354,36 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
             has_invite = True
             registered = True
 
-            async def end(self, timeout=5.0):
-                return {"ok": True, "method": "sip_decline", "timeout": timeout}
+            async def destroy(self, **kwargs):
+                return {"ok": True, "method": "sip_destroy"}
 
-            async def stop(self):
-                return None
+        async def fake_notify(call_id):
+            notified.append(call_id)
+            return {"ok": True, "body": ""}
+
+        api._active_sip_call = FakeSipCall()
+        api.end_call_notify = fake_notify
+
+        result = await api.end_active_call()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(notified, [])
+        self.assertTrue(result["notify"]["skipped"])
+        self.assertEqual(result["notify"]["reason"], "sip_registered")
+        self.assertTrue(result["sip"]["ok"])
+        self.assertIsNone(api.active_call_id)
+
+    async def test_panel_end_active_call_notifies_backend_when_sip_not_registered(self):
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-123")
+        notified = []
+
+        class FakeSipCall:
+            has_invite = False
+            registered = False
+
+            async def destroy(self, **kwargs):
+                return {"ok": True, "method": "sip_destroy"}
 
         async def fake_notify(call_id):
             notified.append(call_id)
@@ -182,8 +397,58 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(notified, ["call-123"])
         self.assertTrue(result["notify"]["ok"])
-        self.assertTrue(result["sip"]["ok"])
         self.assertIsNone(api.active_call_id)
+
+    async def test_panel_end_active_call_keeps_replacement_call_state(self):
+        """A new call arriving during teardown must not be wiped (race guard)."""
+        api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
+        api.set_active_call("call-old")
+        notified = []
+
+        class FakeSipCall:
+            has_invite = True
+            registered = False
+
+            def __init__(self):
+                self.destroyed = False
+
+            async def destroy(self, **kwargs):
+                self.destroyed = True
+                # A new call lands while the old one is being torn down.
+                api.set_active_call("call-new")
+                return {"ok": True, "method": "sip_destroy"}
+
+        old_call = FakeSipCall()
+        new_call = FakeSipCall()
+        api._active_sip_call = old_call
+
+        async def fake_notify(call_id):
+            notified.append(call_id)
+            return {"ok": True, "body": ""}
+
+        api.end_call_notify = fake_notify
+
+        # Simulate start_active_sip_call replacing the session mid-teardown.
+        original_destroy = api._destroy_panel_sip_call
+
+        async def destroy_with_replacement(sip_call, **kwargs):
+            result = await original_destroy(sip_call, **kwargs)
+            api._active_sip_call = new_call
+            api._active_sip_call_id = "call-new"
+            api._active_call_id = "call-new"
+            return result
+
+        api._destroy_panel_sip_call = destroy_with_replacement
+
+        result = await api.end_active_call()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(old_call.destroyed)
+        self.assertFalse(new_call.destroyed)
+        # The replacement call keeps its state: only the old call was reported.
+        self.assertEqual(notified, ["call-old"])
+        self.assertEqual(api.active_call_id, "call-new")
+        self.assertIs(api._active_sip_call, new_call)
 
     async def test_panel_end_active_call_does_not_wait_for_missing_invite(self):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
@@ -208,7 +473,7 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         result = await api.end_active_call()
 
         self.assertTrue(result["ok"])
-        self.assertTrue(result["notify"]["ok"])
+        self.assertTrue(result["notify"]["skipped"])
         self.assertEqual(result["sip"]["reason"], "no_sip_invite")
         self.assertIsNone(api.active_call_id)
 

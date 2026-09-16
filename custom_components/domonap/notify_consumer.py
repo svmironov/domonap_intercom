@@ -111,13 +111,10 @@ class IntercomNotifyConsumer:
         except Exception:
             _LOGGER.warning("update_device_token failed", exc_info=True)
 
-        negotiate = await self._api.get_notify_id_token()
-        if not negotiate or not negotiate.get("connectionToken"):
-            raise RuntimeError("Negotiation failed: no connectionToken")
-        conn_token = negotiate["connectionToken"]
-        _LOGGER.debug("Negotiated connectionToken: %s", conn_token)
-
-        ws_url = WS_URL + conn_token
+        # The app connects with shouldSkipNegotiate(true): the WebSocket is
+        # opened directly on the hub URL without a negotiate round trip, so
+        # there is no connectionToken to append.
+        ws_url = WS_URL
         self._headers = dict(self._api.signalr_headers())
         self._headers["Authorization"] = f"Bearer {self._api.access_token or ''}"
         self._headers["Sec-WebSocket-Protocol"] = "json"

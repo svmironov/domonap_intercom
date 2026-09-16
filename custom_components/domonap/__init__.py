@@ -35,6 +35,8 @@ from .const import (
     OPT_EXTERNAL_SIP_TRANSPORT,
     OPT_EXTERNAL_SIP_CALL_NUMBER,
     EXTERNAL_SIP_TRANSPORT_UDP,
+    OPT_CALL_END_MODE,
+    CALL_END_MODE_ANSWER,
 )
 
 if TYPE_CHECKING:
@@ -154,6 +156,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         new_data.get(PARAM_REFRESH_TOKEN),
         new_data.get(PARAM_REFRESH_EXPIRATION),
     )
+    # How relay actions end the active call: accept first (mutes the panel,
+    # BYE afterwards) or decline right away (603, faster on flaky SIP).
+    api.call_end_mode = entry.options.get(OPT_CALL_END_MODE, CALL_END_MODE_ANSWER)
     setup_complete = False
 
     def update_entry(

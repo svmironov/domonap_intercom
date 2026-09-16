@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, Optional, Union
 from uuid import UUID
 
 from .sip import DomonapSipCall
+from .const import CALL_END_MODE_ANSWER
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -133,6 +134,10 @@ class IntercomAPI:
         self._active_call_lock = asyncio.Lock()
         self._active_sip_call: Optional[DomonapSipCall] = None
         self._active_sip_call_id: Optional[str] = None
+        # How an active call is ended around relay actions: "answer" accepts it
+        # first (200 OK mutes the panel) and hangs up with BYE, "reject" declines
+        # with 603 right away.
+        self.call_end_mode: str = CALL_END_MODE_ANSWER
         # Порядок и формат заголовков как у DeviceIdInterceptor приложения:
         # dom-app/dom-platform с суффиксом ";", instanceId — БЕЗ ";", плюс
         # device-info с JSON профиля устройства.
@@ -201,7 +206,7 @@ class IntercomAPI:
             self._session._default_headers.update(self.headers)
 
     def signalr_headers(self) -> Dict[str, str]:
-        """Заголовки для SignalR (negotiate + WebSocket-апгрейд).
+        """Заголовки для SignalR (WebSocket-апгрейд хаба).
 
         В приложении hub использует отдельный OkHttp-клиент, который в DI-колбэке
         (`provideSignalR`) получает только DeviceCoreServicesRepository, поэтому
@@ -496,6 +501,7 @@ class IntercomAPI:
 
     async def open_relay_by_door_id(self, door_id: str):
         payload = {"doorId": door_id}
+        await self._answer_active_sip_before_open()
         res = await self._post("/client-api/Device/OpenRelayByDoorId", payload, need_auth=True, expect="text")
         if isinstance(res, dict) and "error" in res:
             return res
@@ -503,18 +509,43 @@ class IntercomAPI:
 
     async def open_relay_by_key_id(self, key_id: str):
         payload = {"keyId": key_id}
+        await self._answer_active_sip_before_open()
         res = await self._post("/client-api/Device/OpenRelayByKeyId", payload, need_auth=True, expect="text")
         if isinstance(res, dict) and "error" in res:
             return res
         return {"ok": True, "body": res}
 
-    async def answer_call_notify(self, call_id: str):
-        payload = {"callId": call_id}
-        res = await self._post("/communication-api/Call/NotifyCallAnswered", payload, need_auth=True, expect="text")
-        if isinstance(res, dict) and "error" in res:
-            return res
-        _LOGGER.debug("answer_call_notify(%s) -> %s", call_id, res)
-        return {"ok": True, "body": res}
+    async def _answer_active_sip_before_open(self, *, force: bool = False) -> Dict[str, Any] | None:
+        """Answer the active SIP call before a relay action, like the app.
+
+        The app accepts the incoming call before requesting the relay opening.
+        That ordering matters for forked calls: rejecting our still-ringing
+        branch does not stop the originating panel while accepting it does.
+        Answering sends a 200 OK with a no-media SDP, so the panel goes silent
+        without any audio flowing through Home Assistant.
+
+        Skipped in the "reject" call-end mode unless ``force`` is set (the
+        silence service always mutes the panel regardless of the mode).
+        """
+        if not force and self.call_end_mode != CALL_END_MODE_ANSWER:
+            return None
+        sip_call = self._active_sip_call
+        answer = getattr(sip_call, "answer", None)
+        if not self._active_call_id or not callable(answer):
+            return None
+        try:
+            result = await sip_call.answer(timeout=2.0)
+        except Exception as err:
+            _LOGGER.warning("SIP answer before relay opening failed: %s", err)
+            return {"ok": False, "error": str(err)}
+        if not (isinstance(result, dict) and result.get("ok") is True):
+            _LOGGER.warning("SIP answer before relay opening failed: %s", result)
+        else:
+            _LOGGER.info(
+                "SIP call %s answered before relay opening",
+                self._active_call_id,
+            )
+        return result
 
     @property
     def active_call_id(self) -> Optional[str]:
@@ -848,18 +879,3 @@ class IntercomAPI:
             return res
         _LOGGER.debug("end_call_notify(%s) -> %s", call_id, res)
         return {"ok": True, "body": res}
-
-    async def get_notify_id_token(self) -> Optional[dict]:
-        res = await self._post(
-            "/notificationHub/negotiate?negotiateVersion=1",
-            need_auth=True,
-            expect="json",
-            header_set=self.signalr_headers(),
-        )
-        if isinstance(res, dict) and "error" in res and "status" in res:
-            _LOGGER.debug("negotiate failed: %s", res)
-            return None
-        return {
-            "connectionId": res.get("connectionId"),
-            "connectionToken": res.get("connectionToken"),
-        }

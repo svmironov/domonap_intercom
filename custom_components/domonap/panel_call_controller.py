@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -12,9 +13,15 @@ from .panel_sip import RubetekPanelSipCall
 
 _LOGGER = logging.getLogger(__name__)
 
+# EndCallTimer.TIMER_MILLIS = 0xea60 in the APK: the panel caps a call at 60
+# seconds. The countdown starts when the call arrives (TelephonyService) and is
+# restarted once the SIP call connects (CallOrchestrator.observeSipEvents), so
+# neither ringing nor an established conversation outlives this limit.
+CALL_TIMER_SECONDS = 60.0
+
 
 class PanelCallController:
-    """Coordinate Domonap Panel SIP, relay actions and an optional Asterisk leg.
+    """Coordinate Domonap Panel SIP, relay actions and an optional Asterisk dialog.
 
     The controller is intentionally outside IntercomAPI. Authentication and
     Domonap REST stay unchanged, while call routing policy can evolve without
@@ -33,6 +40,7 @@ class PanelCallController:
         domain: str = "",
         transport: str = "udp",
         call_number: str = "",
+        call_timer_seconds: float = CALL_TIMER_SECONDS,
     ) -> None:
         self._hass = hass
         self._api = api
@@ -47,7 +55,12 @@ class PanelCallController:
         self._active_call_id: str | None = None
         self._active_door_id: str | None = None
         self._forward_task: asyncio.Task | None = None
-        self._ending_all_legs = False
+        self._teardown_in_progress = False
+        self._call_timer_seconds = float(call_timer_seconds)
+        self._call_timer_tick = max(0.05, min(1.0, self._call_timer_seconds / 20.0))
+        self._call_timer_task: asyncio.Task | None = None
+        self._call_deadline: float | None = None
+        self._call_timer_restarted_on_answer = False
 
     @property
     def enabled(self) -> bool:
@@ -85,6 +98,13 @@ class PanelCallController:
         await self._account.start()
 
     async def stop(self) -> None:
+        timer_task = self._call_timer_task
+        self._cancel_call_timer()
+        if timer_task is not None and not timer_task.done():
+            try:
+                await timer_task
+            except asyncio.CancelledError:
+                pass
         task = self._forward_task
         self._forward_task = None
         if task is not None and not task.done():
@@ -105,12 +125,15 @@ class PanelCallController:
         self._active_door_id = self._string_value(
             push_data.get("DoorId") or push_data.get("doorId")
         )
+        # The APK EndCallTimer runs for every incoming call, with or without a
+        # forwarding target, so start it before the external SIP check.
+        self._start_call_timer()
         if not self._enabled or self._account is None:
             return
 
         panel_call = getattr(self._api, "_active_sip_call", None)
         if not isinstance(panel_call, RubetekPanelSipCall):
-            _LOGGER.warning("Cannot forward panel call: Domonap SIP leg is unavailable")
+            _LOGGER.warning("Cannot forward panel call: Domonap SIP session is unavailable")
             return
 
         previous = self._forward_task
@@ -125,6 +148,7 @@ class PanelCallController:
         normalized = self._string_value(call_id)
         if normalized and self._active_call_id and normalized != self._active_call_id:
             return
+        self._cancel_call_timer()
         call = self._account.active_call if self._account else None
         if call is not None:
             try:
@@ -140,11 +164,11 @@ class PanelCallController:
     async def open_door_by_door_id(self, door_id: str) -> Any:
         """Open a door using the APK-compatible call state transition.
 
-        If the Asterisk leg is already established, the Panel SIP leg is already
-        answered and we only open the relay here. The caller must then invoke
-        ``end_after_relay()`` so both SIP legs are terminated. If there is no
-        established external leg, the Panel API performs the APK-style silent
-        answer before opening the relay.
+        If the Asterisk dialog is already established, the Domonap SIP session
+        is already answered and we only open the relay here. The caller must
+        then invoke ``end_after_relay()`` so both SIP dialogs are terminated. If
+        there is no established external dialog, the Panel API performs the
+        APK-style silent answer before opening the relay.
         """
         if self.external_call_established:
             return await self._open_panel_relay_only(door_id)
@@ -164,9 +188,18 @@ class PanelCallController:
         """Door opening always ends the call, matching the panel APK."""
         return True
 
+    async def end_call(self, *, source: str = "manual") -> dict[str, Any] | None:
+        """Terminate every active call dialog without touching the relay.
+
+        Used by the silence/reject services: the Domonap SIP session and the
+        optional external Asterisk dialog are ended together, exactly like the
+        relay flow does after opening a door.
+        """
+        return await self._end_call_dialogs(source=source, end_external=True)
+
     async def end_after_relay(self, *, source: str = "relay") -> dict[str, Any] | None:
-        """Terminate every active call leg after a successful relay opening."""
-        return await self._end_all_call_legs(source=source, end_external=True)
+        """Terminate every active call dialog after a successful relay opening."""
+        return await self.end_call(source=source)
 
     async def _forward_to_external(
         self, panel_call: RubetekPanelSipCall, call_id: str
@@ -185,7 +218,7 @@ class PanelCallController:
             raise
         except Exception:
             _LOGGER.warning("Cannot start external SIP forwarding", exc_info=True)
-            await self._end_all_call_legs(
+            await self._end_call_dialogs(
                 source="external_sip_forward_failure", end_external=False
             )
 
@@ -207,10 +240,10 @@ class PanelCallController:
             return
 
         _LOGGER.info(
-            "Door %s opened by external SIP DTMF 1; ending all call legs",
+            "Door %s opened by external SIP DTMF 1; ending the call",
             door_id,
         )
-        end_result = await self._end_all_call_legs(
+        end_result = await self._end_call_dialogs(
             source="external_sip_dtmf_1", end_external=True
         )
         if isinstance(end_result, dict) and not end_result.get("ok", False):
@@ -218,11 +251,76 @@ class PanelCallController:
 
     async def _on_external_hangup(self) -> None:
         _LOGGER.info("External SIP call ended; terminating the Domonap call")
-        await self._end_all_call_legs(
+        await self._end_call_dialogs(
             source="external_sip_peer_hangup", end_external=False
         )
 
-    async def _end_all_call_legs(
+    def _start_call_timer(self) -> None:
+        """Mirror the APK EndCallTimer: cap the current call at the time limit."""
+        self._call_deadline = time.monotonic() + self._call_timer_seconds
+        self._call_timer_restarted_on_answer = False
+        if self._call_timer_task is None or self._call_timer_task.done():
+            self._call_timer_task = asyncio.create_task(
+                self._call_timer_loop(), name="domonap_panel_call_timer"
+            )
+
+    def _cancel_call_timer(self) -> None:
+        self._call_deadline = None
+        self._call_timer_restarted_on_answer = False
+        task = self._call_timer_task
+        self._call_timer_task = None
+        if (
+            task is not None
+            and not task.done()
+            and task is not asyncio.current_task()
+        ):
+            task.cancel()
+
+    async def _call_timer_loop(self) -> None:
+        """End the active call once the APK call deadline expires.
+
+        The panel starts this countdown on the incoming push and restarts it
+        when the SIP call connects. Establishment is observed by polling the
+        external dialog state because the Asterisk bridge exposes no callback.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._call_timer_tick)
+                if self._active_call_id is None and not self.external_call_active:
+                    # No call in flight: nothing to time out. A later incoming
+                    # push restarts the timer through _start_call_timer().
+                    self._call_deadline = None
+                    self._call_timer_restarted_on_answer = False
+                    continue
+
+                if (
+                    self.external_call_established
+                    and not self._call_timer_restarted_on_answer
+                ):
+                    # SIP CONNECTED restarts the countdown in the APK.
+                    self._call_timer_restarted_on_answer = True
+                    self._call_deadline = (
+                        time.monotonic() + self._call_timer_seconds
+                    )
+                    _LOGGER.debug(
+                        "Panel call timer restarted on established external dialog"
+                    )
+
+                deadline = self._call_deadline
+                if deadline is not None and time.monotonic() >= deadline:
+                    _LOGGER.info(
+                        "Panel call %s reached the %.0fs limit; ending the call",
+                        self._active_call_id,
+                        self._call_timer_seconds,
+                    )
+                    await self._end_call_dialogs(
+                        source="call_timer", end_external=True
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def _end_call_dialogs(
         self,
         *,
         source: str,
@@ -230,12 +328,12 @@ class PanelCallController:
     ) -> dict[str, Any] | None:
         """End the Asterisk dialog and the temporary Domonap Panel session.
 
-        The two legs are independent SIP dialogs. Once the door is opened they
-        are terminated in parallel so neither leg unnecessarily keeps the call
-        alive. ``RubetekPanelIntercomAPI.end_active_call`` is responsible for
+        The two SIP dialogs are independent. Once the door is opened they are
+        terminated in parallel so neither keeps the call alive unnecessarily.
+        ``RubetekPanelIntercomAPI.end_active_call`` is responsible for
         NotifyCallEnded + Panel SIP termination + REGISTER Expires: 0.
         """
-        if self._ending_all_legs:
+        if self._teardown_in_progress:
             _LOGGER.debug("Call teardown already in progress (source=%s)", source)
             return {
                 "ok": True,
@@ -249,7 +347,7 @@ class PanelCallController:
         if not call_id and (external_call is None or not end_external):
             return None
 
-        self._ending_all_legs = True
+        self._teardown_in_progress = True
         try:
             external_task: asyncio.Task | None = None
             domonap_task: asyncio.Task | None = None
@@ -257,12 +355,12 @@ class PanelCallController:
             if end_external and external_call is not None:
                 external_task = asyncio.create_task(
                     external_call.hangup(local=True),
-                    name="domonap_end_external_sip_leg",
+                    name="domonap_end_external_sip_dialog",
                 )
             if call_id:
                 domonap_task = asyncio.create_task(
-                    self._api.end_active_call(),
-                    name="domonap_end_panel_sip_leg",
+                    self._api.end_active_call(expected_call_id=call_id),
+                    name="domonap_end_panel_sip_call",
                 )
 
             external_result: Any = None
@@ -297,16 +395,16 @@ class PanelCallController:
 
             if external_error is not None:
                 _LOGGER.warning(
-                    "External SIP leg teardown failed after %s: %s",
+                    "External SIP teardown failed after %s: %s",
                     source,
                     external_error,
                 )
             elif external_task is not None:
-                _LOGGER.info("External SIP leg ended after %s", source)
+                _LOGGER.info("External SIP call ended after %s", source)
 
             if domonap_error is not None:
                 _LOGGER.warning(
-                    "Domonap SIP leg teardown failed after %s: %s",
+                    "Domonap SIP teardown failed after %s: %s",
                     source,
                     domonap_error,
                 )
@@ -327,7 +425,7 @@ class PanelCallController:
                 )
 
             ok = external_ok and domonap_ok
-            if domonap_ok:
+            if domonap_ok and self._active_call_id in (None, call_id):
                 self._active_call_id = None
                 self._active_door_id = None
 
@@ -350,7 +448,11 @@ class PanelCallController:
                 ),
             }
         finally:
-            self._ending_all_legs = False
+            self._teardown_in_progress = False
+            # Do not cancel a call timer that a newer incoming call started
+            # while this teardown was still running.
+            if self._active_call_id in (None, call_id):
+                self._cancel_call_timer()
 
     async def _open_panel_relay_only(self, door_id: str) -> Any:
         """Resolve DoorId -> KeyId without changing either SIP dialog."""

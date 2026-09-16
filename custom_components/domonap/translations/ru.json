@@ -82,12 +82,14 @@
           "external_sip_password": "SIP Password",
           "external_sip_domain": "SIP domain",
           "external_sip_transport": "Transport",
-          "external_sip_call_number": "Номер для звонка"
+          "external_sip_call_number": "Номер для звонка",
+          "call_end_mode": "Режим завершения вызова"
         },
         "data_description": {
           "external_sip_domain": "Например: 192.168.10.1:5060",
           "external_sip_transport": "Сейчас поддерживается UDP",
-          "external_sip_call_number": "Например: 100; для DTMF 1 настройте SIP leg к Home Assistant на dtmf_mode=info"
+          "external_sip_call_number": "Например: 100; для DTMF 1 настройте SIP leg к Home Assistant на dtmf_mode=info",
+          "call_end_mode": "answer — сначала принять вызов и завершить его (200 OK глушит панель домофона, затем BYE). reject — сразу сбросить вызов (603, панель не замолкает, быстрее при нестабильном SIP)."
         }
       }
     }

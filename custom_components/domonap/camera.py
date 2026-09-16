@@ -270,7 +270,6 @@ def _make_video_camera_entity(
         device_identifier=entity_unique_id,
         device_name=name,
         device_model="Video Camera",
-        preserve_via_device=False,
     )
 
 
@@ -305,8 +304,6 @@ class IntercomCamera(Camera):
         device_identifier: str | None = None,
         device_name: str | None = None,
         device_model: str = "Intercom Device",
-        via_device_identifier: str | None = None,
-        preserve_via_device: bool = True,
     ):
         super().__init__()
         self._api = api
@@ -323,10 +320,6 @@ class IntercomCamera(Camera):
         self._device_identifier = device_identifier or key_id
         self._device_name = device_name or name
         self._device_model = device_model
-        if preserve_via_device:
-            self._via_device_identifier = via_device_identifier or key_id
-        else:
-            self._via_device_identifier = None
 
     @property
     def extra_state_attributes(self):
@@ -366,15 +359,12 @@ class IntercomCamera(Camera):
 
     @property
     def device_info(self):
-        info = {
+        return {
             "identifiers": {(DOMAIN, self._device_identifier)},
             "name": self._device_name,
             "manufacturer": "Domonap",
             "model": self._device_model,
         }
-        if self._via_device_identifier:
-            info["via_device"] = (DOMAIN, self._via_device_identifier)
-        return info
 
     async def async_update(self):
         _LOGGER.debug(f"Updating camera: {self._name}")
