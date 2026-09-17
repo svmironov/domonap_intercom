@@ -70,6 +70,35 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_key_cache_is_separate_for_active_doors_and_main_cameras(self):
+        api = api_module.IntercomAPI()
+        calls = []
+
+        async def fake_get_paged_keys(*, current_page=1, keys_type="Active", **kwargs):
+            calls.append((current_page, keys_type))
+            return {
+                "results": [
+                    {
+                        "id": f"{keys_type.lower()}-key",
+                        "webrtcVideoUrl": (
+                            "https://webrtc.example/camera/" if keys_type == "Main" else None
+                        ),
+                    }
+                ],
+                "pageCount": 1,
+            }
+
+        api.get_paged_keys = fake_get_paged_keys
+
+        active = await api.get_keys()
+        main = await api.get_keys(keys_type="Main")
+        main_again = await api.get_keys(keys_type="Main")
+
+        self.assertEqual(active["results"][0]["id"], "active-key")
+        self.assertEqual(main["results"][0]["id"], "main-key")
+        self.assertEqual(main_again, main)
+        self.assertEqual(calls, [(1, "Active"), (1, "Main")])
+
     def test_panel_identity_matches_captured_aosp_contract(self):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         self.assertEqual(api.headers["dom-app"], "panel;")

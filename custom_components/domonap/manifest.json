@@ -7,5 +7,5 @@
   "requirements": ["transliterate", "aiohttp>=3.9.3"],
   "iot_class": "cloud_push",
   "config_flow": true,
-  "version": "1.4.6"
+  "version": "1.4.8"
 }

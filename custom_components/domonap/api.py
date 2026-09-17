@@ -159,7 +159,7 @@ class IntercomAPI:
         self.config_entry_id: str | None = None
         self.runtime_status = RuntimeStatus()
         self._keys_lock = asyncio.Lock()
-        self._keys_cache = None
+        self._keys_cache: dict[str, dict[str, Any]] | None = None
         self._background_tasks: set[asyncio.Task] = set()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
@@ -491,19 +491,27 @@ class IntercomAPI:
         }
         return await self._post("/client-api/Key/GetPagedKeysByKeysType", payload, need_auth=True, expect="json")
 
-    async def get_keys(self):
-        """Load all doors once per account runtime; reload the entry to refresh.
+    async def get_keys(self, keys_type: str = "Active"):
+        """Load all keys of one type once; reload the entry to refresh.
 
         Failed or partial reads never replace the cache. Concurrent callers share
         the refresh lock; pagination without metadata ends on a short page.
         """
         async with self._keys_lock:
-            if self._keys_cache is not None:
-                return deepcopy(self._keys_cache)
+            cached = (
+                self._keys_cache.get(keys_type)
+                if self._keys_cache is not None
+                else None
+            )
+            if cached is not None:
+                return deepcopy(cached)
             keys = []
             seen = set()
             for page in range(1, 1001):
-                response = await self.get_paged_keys(current_page=page)
+                response = await self.get_paged_keys(
+                    current_page=page,
+                    keys_type=keys_type,
+                )
                 if not isinstance(response, dict) or not isinstance(response.get("results"), list):
                     if isinstance(response, dict) and "error" in response:
                         return response
@@ -523,8 +531,11 @@ class IntercomAPI:
                 if (isinstance(page_count, int) and page >= page_count) or (
                     page_count is None and len(batch) < 100
                 ):
-                    self._keys_cache = {"results": keys}
-                    return deepcopy(self._keys_cache)
+                    result = {"results": keys}
+                    if self._keys_cache is None:
+                        self._keys_cache = {}
+                    self._keys_cache[keys_type] = result
+                    return deepcopy(result)
                 if len(keys) == previous_count:
                     return {"ok": False, "error": "Key pagination made no progress"}
             return {"ok": False, "error": "Key pagination limit exceeded"}

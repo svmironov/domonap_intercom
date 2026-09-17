@@ -25,10 +25,8 @@ except ImportError:
     WebRTCSendMessage = None
 
 from .const import API, DOMAIN, PARAM_WEBRTC_PROXY_SECRET, WEBRTC_PROXY
-from .util import scoped_entity_unique_id
+from .util import scoped_device_id, scoped_entity_unique_id
 from .webrtc_proxy import _resolve_upstream_session_url
-
-from .util import scoped_device_id
 
 _LOGGER = logging.getLogger(__name__)
 CAMERA_CATEGORY_NAMES = {
@@ -62,7 +60,10 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     api = hass.data[DOMAIN][config_entry.entry_id][API]
     proxy = hass.data[DOMAIN][WEBRTC_PROXY]
     proxy_secret = config_entry.data.get(PARAM_WEBRTC_PROXY_SECRET)
-    key_response = await api.get_keys()
+    # The camera cards are exposed by the API's Main (favorites) view.  Door
+    # entities use Active so non-favorite doors remain available, but using that
+    # list here can omit the stream fields on some accounts.
+    key_response = await api.get_keys(keys_type="Main")
     key_entities = _build_key_camera_entities(
         config_entry,
         api,
