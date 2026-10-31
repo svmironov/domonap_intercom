@@ -31,8 +31,8 @@ _GENERATED_ANDROID_GUIDS: set[str] = set()
 
 # Версия приложения Domonap (BuildConfig.VERSION_CODE / VERSION_NAME из APK).
 # Подставляется в заголовок device-info, чтобы совпадать с оригинальным клиентом.
-APP_VERSION_CODE = "9848"
-APP_VERSION_NAME = "9848"
+APP_VERSION_CODE = "9852"
+APP_VERSION_NAME = "9852"
 
 # Реальные согласованные Build-профили Android-устройств (Google-флейвор,
 # DeviceCoreService.Android). Профиль выбирается детерминированно по instanceId,
