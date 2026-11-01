@@ -1,6 +1,7 @@
 import json
 import logging
 import asyncio
+import time
 import aiohttp
 from random import randint
 from typing import Callable, Optional, Any, Iterable, Union
@@ -8,6 +9,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import IntercomAPI, _generate_device_token
 from .const import (
+    EVENT_CALL_ANSWERED,
     EVENT_CALL_ENDED,
     EVENT_INCOMING_CALL,
     WS_MESSAGE_END,
@@ -22,6 +24,9 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class IntercomNotifyConsumer:
+    _STALE_CONNECTION_TIMEOUT = 120.0
+    _POST_CALL_RECONNECT_DELAY = 5.0
+
     def __init__(
         self,
         hass: HomeAssistant,
@@ -46,6 +51,9 @@ class IntercomNotifyConsumer:
         self._headers = dict(self._api.signalr_headers())
         self._headers["Authorization"] = f"Bearer {self._api.access_token or ''}"
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._post_call_reconnect_task: Optional[asyncio.Task] = None
+        self._had_call_on_connection = False
+        self._last_invocation = time.monotonic()
         if hasattr(self._api, "token_update_callback") and self._api.token_update_callback is None:
             self._api.token_update_callback = self._on_token_update
 
@@ -79,6 +87,7 @@ class IntercomNotifyConsumer:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        self._cancel_post_call_reconnect()
         if self._ws is not None and not self._ws.closed:
             try:
                 await self._ws.close()
@@ -114,7 +123,12 @@ class IntercomNotifyConsumer:
             ok = await self._api.update_device_token(self._api.device_token)
             _LOGGER.info("update_device_token result: %s", ok)
         except Exception:
+            ok = False
             _LOGGER.warning("update_device_token failed", exc_info=True)
+        if not ok:
+            _LOGGER.warning(
+                "Device token registration failed; connecting WS with previous binding"
+            )
 
         # The app connects with shouldSkipNegotiate(true): the WebSocket is
         # opened directly on the hub URL without a negotiate round trip, so
@@ -143,7 +157,9 @@ class IntercomNotifyConsumer:
                 _LOGGER.info("WS connected to %s", ws_url)
                 self._connected = True
                 self._reconnect_delay = 1
-                self._username = await self._api.get_username()
+                self._had_call_on_connection = False
+                self._last_invocation = time.monotonic()
+                self._username = await self._api.get_username() or ""
                 await ws.send_str(WS_HANDSHAKE_MESSAGE)
                 ping_task = asyncio.ensure_future(self._keepalive(ws))
                 try:
@@ -189,10 +205,50 @@ class IntercomNotifyConsumer:
                 await asyncio.sleep(WS_KEEPALIVE_INTERVAL)
                 if ws.closed or self._stop_event.is_set():
                     break
+                # Если после звонка долго нет событий (только пинги), значит
+                # сервер перестал присылать пуши в это соединение
+                if (
+                    self._had_call_on_connection
+                    and time.monotonic() - self._last_invocation
+                    > self._STALE_CONNECTION_TIMEOUT
+                ):
+                    _LOGGER.warning(
+                        "No push events for %ds after a call; forcing WS reconnect",
+                        int(self._STALE_CONNECTION_TIMEOUT),
+                    )
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    break
                 try:
                     await ws.send_str(WS_PING_MESSAGE)
                 except Exception:
                     break
+        except asyncio.CancelledError:
+            pass
+
+    def _cancel_post_call_reconnect(self) -> None:
+        if self._post_call_reconnect_task is not None:
+            self._post_call_reconnect_task.cancel()
+            self._post_call_reconnect_task = None
+
+    def _schedule_post_call_reconnect(self) -> None:
+        self._cancel_post_call_reconnect()
+        self._post_call_reconnect_task = asyncio.ensure_future(
+            self._post_call_reconnect()
+        )
+
+    async def _post_call_reconnect(self) -> None:
+        try:
+            await asyncio.sleep(self._POST_CALL_RECONNECT_DELAY)
+            if self._stop_event.is_set():
+                return
+            _LOGGER.info(
+                "Forcing WS reconnect after call (DomofonCallEnded not received)"
+            )
+            if self._ws is not None and not self._ws.closed:
+                await self._ws.close()
         except asyncio.CancelledError:
             pass
 
@@ -230,6 +286,7 @@ class IntercomNotifyConsumer:
 
     async def _handle_invocation(self, data: dict, ws: aiohttp.ClientWebSocketResponse) -> None:
         self._api.runtime_status.event_received()
+        self._last_invocation = time.monotonic()
         target = data.get("target")
         args: Iterable = data.get("arguments") or []
         if target == "ReceivePush":
@@ -239,6 +296,8 @@ class IntercomNotifyConsumer:
                     push_data["config_entry_id"] = self._api.config_entry_id
                 evt = push_data.get("EventMessage")
                 if evt == "DomofonCalling":
+                    self._had_call_on_connection = True
+                    self._cancel_post_call_reconnect()
                     self._api.set_active_call(
                         push_data.get("CallId") or push_data.get("callId")
                     )
@@ -246,7 +305,15 @@ class IntercomNotifyConsumer:
                     await self._prepare_incoming_call_event(push_data)
                     self._hass.bus.fire(EVENT_INCOMING_CALL, push_data)
                     _LOGGER.info("Incoming call fired: DoorId=%s CallId=%s", push_data.get("DoorId"), push_data.get("CallId"))
+                elif evt == "DomofonCallAnswered":
+                    self._hass.bus.fire(EVENT_CALL_ANSWERED, push_data)
+                    _LOGGER.info(
+                        "Call answered (self or elsewhere): CallId=%s",
+                        push_data.get("CallId") or push_data.get("callId"),
+                    )
+                    self._schedule_post_call_reconnect()
                 elif evt == "DomofonCallEnded":
+                    self._cancel_post_call_reconnect()
                     call_id = push_data.get("CallId") or push_data.get("callId")
                     self._api.clear_active_call(
                         call_id
@@ -258,7 +325,7 @@ class IntercomNotifyConsumer:
                     if self._ws is not None and not self._ws.closed:
                         await self._ws.close()
                 else:
-                    _LOGGER.debug("Unknown EventMessage=%s push=%s", evt, str(push_data)[:200])
+                    _LOGGER.info("Push event: EventMessage=%s push=%s", evt, str(push_data)[:200])
         elif target in ('ReceiveOnline', "ReceiveOffline"):
             user = data.get('arguments')[0]
             status = data.get('target').replace('ReceiveO', 'o')
