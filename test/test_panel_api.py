@@ -99,6 +99,71 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main_again, main)
         self.assertEqual(calls, [(1, "Active"), (1, "Main")])
 
+    def test_intercom_api_device_info_contract_9852(self):
+        api = api_module.IntercomAPI(instance_id="test-instance-12345")
+        info = json.loads(api.headers["device-info"])
+        self.assertEqual(info["InstanceId"], "test-instance-12345")
+        self.assertEqual(info["versionCode"], "9852")
+        self.assertEqual(info["versionName"], "9852")
+        self.assertIs(info["isGrapheneOs"], False)
+        self.assertIn("Brand", info)
+        self.assertIn("Model", info)
+
+    async def test_get_video_archive(self):
+        api = api_module.IntercomAPI()
+        calls = []
+
+        async def fake_post(path, payload=None, **kwargs):
+            calls.append((path, payload, kwargs))
+            return {
+                "name": "Front Door",
+                "playbackUrl": "https://stream.example/live",
+                "webRtcUrl": "https://stream.example/whep",
+                "hlsUrl": "https://stream.example/hls",
+                "accessToken": "tok-123",
+                "accessTokenExpiresAtUtc": "2026-10-01T00:00:00Z",
+            }
+
+        api._post = fake_post
+        res = await api.get_video_archive("src-42")
+
+        self.assertEqual(calls[0][0], "/client-api/VideoArchive/GetVideoArchive")
+        self.assertEqual(calls[0][1], {"sourceId": "src-42"})
+        self.assertEqual(calls[0][2].get("need_auth"), True)
+        self.assertEqual(res["name"], "Front Door")
+
+    async def test_get_open_door_by_key_logs(self):
+        api = api_module.IntercomAPI()
+        calls = []
+
+        async def fake_post(path, payload=None, **kwargs):
+            calls.append((path, payload, kwargs))
+            return {
+                "items": [{"isSuccess": True, "timestamp": "2026-09-28T12:00:00Z"}],
+                "totalCount": 1,
+            }
+
+        api._post = fake_post
+        res = await api.get_open_door_by_key_logs("key-99", start_index=10, count=20)
+
+        self.assertEqual(calls[0][0], "/client-api/Device/GetOpenDoorByKeyLogs")
+        self.assertEqual(calls[0][1], {"keyId": "key-99", "startIndex": 10, "count": 20})
+        self.assertEqual(calls[0][2].get("need_auth"), True)
+        self.assertEqual(res["totalCount"], 1)
+
+    def test_build_video_archive_playback_url(self):
+        url = api_module.IntercomAPI.build_video_archive_playback_url(
+            "https://stream.example/live/cam1",
+            start="2026-09-28T10:00:00Z",
+            duration=30.0,
+            format="fmp4",
+        )
+        self.assertTrue(url.startswith("https://stream.example/get?"))
+        self.assertIn("path=live%2Fcam1", url)
+        self.assertIn("start=2026-09-28T10%3A00%3A00Z", url)
+        self.assertIn("duration=30.0", url)
+        self.assertIn("format=fmp4", url)
+
     def test_panel_identity_matches_captured_aosp_contract(self):
         api = RubetekPanelIntercomAPI(instance_id="0123456789abcdef")
         self.assertEqual(api.headers["dom-app"], "panel;")
@@ -569,6 +634,112 @@ class RubetekPanelApiTests(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaises(ValueError):
             RubetekPanelIntercomAPI.from_session_payload(session)
+
+    def test_parse_dt_naive_and_offset_handling(self):
+        api = api_module.IntercomAPI()
+        # Naive datetime must produce a UTC-aware datetime so comparisons do not raise TypeError
+        naive_dt = api._parse_dt("2026-11-09T18:50:00")
+        self.assertIsNotNone(naive_dt)
+        self.assertIsNotNone(naive_dt.tzinfo)
+        self.assertFalse(api._refresh_expired())
+
+        api.refresh_token = "some-token"
+        api.refresh_expiration_date = "2020-01-01T00:00:00"
+        # Should cleanly evaluate to True without TypeError:
+        self.assertTrue(api._refresh_expired())
+
+        # ISO with Z
+        dt_z = api._parse_dt("2026-11-09T18:50:00Z")
+        self.assertIsNotNone(dt_z)
+        self.assertIsNotNone(dt_z.tzinfo)
+
+        # ISO with offset
+        dt_offset = api._parse_dt("2026-11-09T18:50:00+03:00")
+        self.assertIsNotNone(dt_offset)
+        self.assertIsNotNone(dt_offset.tzinfo)
+
+        # Invalid string
+        self.assertIsNone(api._parse_dt("not-a-datetime"))
+
+    def test_phone_number_sanitization(self):
+        api = api_module.IntercomAPI()
+        # Standard Russian number
+        res = api._phone_number("7", "9991234567")
+        self.assertEqual(res, {"countryCode": 7, "number": 9991234567})
+
+        # Russian number formatted with leading 8
+        res = api._phone_number("7", "8 (999) 123-45-67")
+        self.assertEqual(res, {"countryCode": 7, "number": 9991234567})
+
+        # Country code +7 with +7 formatted number
+        res = api._phone_number("+7", "+7 (999) 123-45-67")
+        self.assertEqual(res, {"countryCode": 7, "number": 9991234567})
+
+        # Empty country code and 11-digit Russian number
+        res = api._phone_number("", "89991234567")
+        self.assertEqual(res, {"countryCode": 7, "number": 9991234567})
+
+        # International number (Belarus)
+        res = api._phone_number("375", "+375 (29) 123-45-67")
+        self.assertEqual(res, {"countryCode": 375, "number": 291234567})
+
+    async def test_update_device_token_skips_empty(self):
+        api = api_module.IntercomAPI()
+        calls = []
+
+        async def fake_post(path, payload=None, **kwargs):
+            calls.append((path, payload))
+            return "OK"
+
+        api._post = fake_post
+        self.assertTrue(await api.update_device_token(None))
+        self.assertTrue(await api.update_device_token(""))
+        self.assertEqual(len(calls), 0)
+
+        self.assertTrue(await api.update_device_token("device-token-123"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "/sso-api/Authorization/UpdateDeviceToken")
+        self.assertEqual(calls[0][1]["deviceToken"], "device-token-123")
+
+    async def test_confirm_authorization_safely_updates_device_token(self):
+        api = api_module.IntercomAPI(device_token="stored-device-token")
+        calls = []
+
+        async def fake_post(path, payload=None, **kwargs):
+            calls.append((path, payload))
+            if path == "/sso-api/Authorization/ConfirmAuthorization":
+                return {
+                    "completeToken": {
+                        "accessToken": fake_jwt(),
+                        "refreshToken": "ref",
+                        "refreshExpirationDate": "2099-01-01T00:00:00Z",
+                    }
+                }
+            return "OK"
+
+        api._post = fake_post
+        res = await api.confirm_authorization("+7", "9991234567", "1234")
+        self.assertIn("completeToken", res)
+        self.assertEqual(calls[0][0], "/sso-api/Authorization/ConfirmAuthorization")
+        self.assertEqual(calls[0][1]["deviceToken"], "stored-device-token")
+        self.assertEqual(calls[1][0], "/sso-api/Authorization/UpdateDeviceToken")
+
+    async def test_camera_endpoints_folder_and_single_camera(self):
+        api = api_module.IntercomAPI()
+        calls = []
+
+        async def fake_post(path, payload=None, **kwargs):
+            calls.append((path, payload))
+            return {"ok": True}
+
+        api._post = fake_post
+        await api.get_folder_video_cameras("folder-42")
+        self.assertEqual(calls[0][0], "/client-api/VideoCamera/GetFolderVideoCameras")
+        self.assertEqual(calls[0][1], {"cameraFolderId": "folder-42"})
+
+        await api.get_user_video_camera("cam-99")
+        self.assertEqual(calls[1][0], "/client-api/VideoCamera/GetUserVideoCamera")
+        self.assertEqual(calls[1][1], {"cameraId": "cam-99"})
 
 
 if __name__ == "__main__":

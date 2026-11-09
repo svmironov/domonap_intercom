@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import aiohttp
 import asyncio
 from copy import deepcopy
@@ -7,6 +8,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from secrets import token_bytes
 from typing import Any, Callable, Dict, Optional, Union
+from urllib.parse import urlencode, urlsplit
 from uuid import UUID
 
 from .sip import DomonapSipCall
@@ -76,6 +78,7 @@ def _build_device_info(instance_id: str) -> str:
         "InstanceId": instance_id,
         "versionCode": APP_VERSION_CODE,
         "versionName": APP_VERSION_NAME,
+        "isGrapheneOs": False,
     }
     return json.dumps(info, separators=(",", ":"), ensure_ascii=False)
 
@@ -244,11 +247,17 @@ class IntercomAPI:
         fmts = ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z")
         for fmt in fmts:
             try:
-                return datetime.strptime(val, fmt)
+                dt = datetime.strptime(val, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
             except ValueError:
                 continue
         try:
-            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         except ValueError:
             pass
         _LOGGER.warning("Cannot parse datetime: %s", val)
@@ -387,7 +396,10 @@ class IntercomAPI:
         finally:
             resp.release()
 
-    async def update_device_token(self, device_token: str) -> bool:
+    async def update_device_token(self, device_token: Optional[str]) -> bool:
+        if not device_token:
+            _LOGGER.debug("UpdateDeviceToken skipped: empty device_token")
+            return True
         _LOGGER.debug("UpdateDeviceToken start")
         result = await self._post(
             "/sso-api/Authorization/UpdateDeviceToken",
@@ -398,7 +410,7 @@ class IntercomAPI:
             retry_on_401=True,
         )
         if isinstance(result, dict) and "error" in result:
-            _LOGGER.error("UpdateDeviceToken failed: %s", result)
+            _LOGGER.warning("UpdateDeviceToken failed: %s", result)
             return False
         _LOGGER.debug("UpdateDeviceToken ok")
         return True
@@ -417,10 +429,11 @@ class IntercomAPI:
         confirm_code: str,
         device_token: Optional[str] = None,
     ) -> Dict[str, Any]:
+        target_token = device_token or self.device_token
         payload = {
             "phoneNumber": self._phone_number(country_code, phone_number),
             "confirmCode": confirm_code,
-            "deviceToken": device_token or self.device_token,
+            "deviceToken": target_token,
         }
         res = await self._post("/sso-api/Authorization/ConfirmAuthorization", payload, expect="json", need_auth=False)
         if isinstance(res, dict) and "error" in res and "status" in res:
@@ -430,13 +443,34 @@ class IntercomAPI:
             self.set_tokens(ct["accessToken"], ct["refreshToken"], ct["refreshExpirationDate"])
             if self.token_update_callback:
                 self.token_update_callback(ct["accessToken"], ct["refreshToken"], ct["refreshExpirationDate"])
-            await self.update_device_token(device_token or self.device_token)
+            if target_token:
+                try:
+                    await self.update_device_token(target_token)
+                except Exception as ex:
+                    _LOGGER.warning("Could not update device token: %s", ex)
         except Exception as e:
             _LOGGER.exception("Unexpected response on confirm_authorization: %s", e)
         return res
 
     def _phone_number(self, country_code: str, phone_number: str) -> Dict[str, int]:
-        return {"countryCode": int(country_code), "number": int(phone_number)}
+        cc_clean = re.sub(r"\D", "", str(country_code or ""))
+        pn_clean = re.sub(r"\D", "", str(phone_number or ""))
+        if not cc_clean:
+            if len(pn_clean) == 11 and pn_clean[0] in ("7", "8"):
+                cc_clean = "7"
+                pn_clean = pn_clean[1:]
+            else:
+                cc_clean = "7"
+        elif cc_clean in ("7", "8"):
+            cc_clean = "7"
+            if len(pn_clean) == 11 and pn_clean[0] == "8":
+                pn_clean = pn_clean[1:]
+            elif pn_clean.startswith("7") and len(pn_clean) > 10:
+                pn_clean = pn_clean[1:]
+        elif cc_clean and pn_clean.startswith(cc_clean) and len(pn_clean) > len(cc_clean):
+            pn_clean = pn_clean[len(cc_clean):]
+
+        return {"countryCode": int(cc_clean or 7), "number": int(pn_clean or 0)}
 
     async def update_token(self) -> Dict[str, Any]:
         if self._refresh_token_invalid:
@@ -551,6 +585,106 @@ class IntercomAPI:
         payload = {"category": category}
         return await self._post(
             "/client-api/VideoCamera/GetUserVideoCameras",
+            payload,
+            need_auth=True,
+            expect="json",
+        )
+
+    async def get_folder_video_cameras(self, folder_id: str):
+        payload = {"cameraFolderId": folder_id}
+        return await self._post(
+            "/client-api/VideoCamera/GetFolderVideoCameras",
+            payload,
+            need_auth=True,
+            expect="json",
+        )
+
+    async def get_user_video_camera(self, camera_id: str):
+        payload = {"cameraId": camera_id}
+        return await self._post(
+            "/client-api/VideoCamera/GetUserVideoCamera",
+            payload,
+            need_auth=True,
+            expect="json",
+        )
+
+    async def get_video_archive(self, source_id: str) -> Dict[str, Any]:
+        """Fetch video archive info for a camera/key source."""
+        payload = {"sourceId": source_id}
+        return await self._post(
+            "/client-api/VideoArchive/GetVideoArchive",
+            payload,
+            need_auth=True,
+            expect="json",
+        )
+
+    async def get_video_archive_segments(
+        self,
+        playback_url: str,
+        access_token: str,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Query MediaMTX recording segments for video archive playback."""
+        parsed = urlsplit(playback_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        playback_path = parsed.path.lstrip("/")
+        params: dict[str, str] = {"path": playback_path}
+        if start is not None:
+            params["start"] = start
+        if end is not None:
+            params["end"] = end
+
+        query_str = urlencode(params)
+        url = f"{origin}/list?{query_str}"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": DEFAULT_USER_AGENT,
+        }
+        session = await self._ensure_external_session()
+        try:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {"ok": True, "segments": data}
+                body = await resp.text()
+                return {"ok": False, "status": resp.status, "error": body}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def build_video_archive_playback_url(
+        playback_url: str,
+        start: str,
+        duration: float,
+        format: str = "fmp4",
+    ) -> str:
+        """Construct a MediaMTX playback segment URL."""
+        parsed = urlsplit(playback_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        playback_path = parsed.path.lstrip("/")
+        params = {
+            "path": playback_path,
+            "start": start,
+            "duration": str(duration),
+            "format": format,
+        }
+        return f"{origin}/get?{urlencode(params)}"
+
+    async def get_open_door_by_key_logs(
+        self,
+        key_id: str,
+        start_index: int = 0,
+        count: int = 30,
+    ) -> Dict[str, Any]:
+        """Fetch door opening logs for a specific key."""
+        payload = {
+            "keyId": key_id,
+            "startIndex": start_index,
+            "count": count,
+        }
+        return await self._post(
+            "/client-api/Device/GetOpenDoorByKeyLogs",
             payload,
             need_auth=True,
             expect="json",

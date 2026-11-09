@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from homeassistant.components.camera import (
@@ -60,16 +63,69 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     api = hass.data[DOMAIN][config_entry.entry_id][API]
     proxy = hass.data[DOMAIN][WEBRTC_PROXY]
     proxy_secret = config_entry.data.get(PARAM_WEBRTC_PROXY_SECRET)
-    # The camera cards are exposed by the API's Main (favorites) view.  Door
-    # entities use Active so non-favorite doors remain available, but using that
-    # list here can omit the stream fields on some accounts.
-    key_response = await api.get_keys(keys_type="Main")
+    # Load both Main (favorites) and Active keys.
+    # Door entities use Active so non-favorite doors remain available.
+    # Checking both ensures that if keys are not favorited in the mobile app,
+    # or if active keys contain stream fields / sourceId, key cameras are still loaded.
+    main_keys_resp, active_keys_resp = await asyncio.gather(
+        api.get_keys(keys_type="Main"),
+        api.get_keys(keys_type="Active"),
+        return_exceptions=True,
+    )
+
+    merged_keys: list[dict] = []
+    seen_key_ids: set[str] = set()
+
+    for resp in (main_keys_resp, active_keys_resp):
+        if isinstance(resp, dict) and isinstance(resp.get("results"), list):
+            for key in resp["results"]:
+                if isinstance(key, dict):
+                    k_id = key.get("id")
+                    if k_id and k_id not in seen_key_ids:
+                        seen_key_ids.add(k_id)
+                        merged_keys.append(key)
+
+    async def _resolve_key_stream(key: dict) -> dict:
+        if not (key.get("httpVideoUrl") or key.get("webrtcVideoUrl")):
+            source_id = key.get("sourceId")
+            if source_id:
+                try:
+                    archive = await api.get_video_archive(source_id)
+                    if isinstance(archive, dict) and "error" not in archive:
+                        updated = dict(key)
+                        if archive.get("webRtcUrl"):
+                            updated["webrtcVideoUrl"] = archive["webRtcUrl"]
+                        if archive.get("hlsUrl") or archive.get("httpVideoUrl"):
+                            updated["httpVideoUrl"] = archive.get("hlsUrl") or archive.get("httpVideoUrl")
+                        return updated
+                except Exception as ex:
+                    _LOGGER.debug(
+                        "Could not resolve archive streams for key %s: %s",
+                        key.get("id"),
+                        ex,
+                    )
+        return key
+
+    if merged_keys:
+        resolved_keys = await asyncio.gather(
+            *(_resolve_key_stream(k) for k in merged_keys),
+            return_exceptions=False,
+        )
+        key_payload = {"results": resolved_keys}
+    else:
+        err_resp = (
+            main_keys_resp
+            if (isinstance(main_keys_resp, (dict, Exception)) and not isinstance(main_keys_resp, list))
+            else active_keys_resp
+        )
+        key_payload = err_resp if isinstance(err_resp, (dict, Exception)) else {"results": []}
+
     key_entities = _build_key_camera_entities(
         config_entry,
         api,
         proxy,
         proxy_secret,
-        key_response,
+        key_payload,
     )
     if key_entities:
         async_add_entities(key_entities, True)
@@ -165,64 +221,112 @@ async def _build_video_camera_entities(
             )
         return []
 
-    categories: list[str] = []
+    area_tasks = []
+    area_meta: list[tuple[str, str, str, str]] = []
+
     for area in response:
         if not isinstance(area, dict):
             continue
+        folder_id = area.get("folderId")
+        folder_name = area.get("folderName")
         category = area.get("category")
-        if category and category not in categories:
-            categories.append(category)
 
-    if not categories:
-        return []
-
-    category_responses = await asyncio.gather(
-        *(api.get_user_video_cameras(category) for category in categories),
-        return_exceptions=True,
-    )
+        if folder_id:
+            area_tasks.append(api.get_folder_video_cameras(folder_id))
+            area_meta.append(("folder", folder_id, folder_name or "Folder", category or "None"))
+        elif category:
+            area_tasks.append(api.get_user_video_cameras(category))
+            area_meta.append(("category", category, "", category))
 
     entities: list[Camera] = []
     seen_unique_ids: set[str] = set()
 
-    for category, category_response in zip(categories, category_responses):
-        if isinstance(category_response, Exception):
-            _LOGGER.exception(
-                "Failed to load Domonap cameras for category %s",
-                category,
-                exc_info=category_response,
-            )
-            continue
+    if area_tasks:
+        area_responses = await asyncio.gather(*area_tasks, return_exceptions=True)
 
-        if isinstance(category_response, dict) and "error" in category_response:
-            _log_api_error(
-                f"Loading Domonap cameras for category {category}", category_response
-            )
-            continue
-
-        if not isinstance(category_response, list):
-            _LOGGER.warning(
-                "Unexpected Domonap cameras payload for category %s: %s",
-                category,
-                type(category_response).__name__,
-            )
-            continue
-
-        category_name = CAMERA_CATEGORY_NAMES.get(category, category)
-        for camera in category_response:
-            entity = _make_video_camera_entity(
-                config_entry,
-                api,
-                proxy,
-                proxy_secret,
-                camera,
-                category,
-                category_name,
-            )
-            if entity is None or entity.unique_id in seen_unique_ids:
+        for (area_type, area_id, folder_name, category), area_resp in zip(
+            area_meta, area_responses
+        ):
+            if isinstance(area_resp, Exception):
+                _LOGGER.exception(
+                    "Failed to load Domonap cameras for %s %s",
+                    area_type,
+                    area_id,
+                    exc_info=area_resp,
+                )
                 continue
 
-            seen_unique_ids.add(entity.unique_id)
-            entities.append(entity)
+            if isinstance(area_resp, dict) and "error" in area_resp:
+                _log_api_error(
+                    f"Loading Domonap cameras for {area_type} {area_id}", area_resp
+                )
+                continue
+
+            if not isinstance(area_resp, list):
+                _LOGGER.warning(
+                    "Unexpected Domonap cameras payload for %s %s: %s",
+                    area_type,
+                    area_id,
+                    type(area_resp).__name__,
+                )
+                continue
+
+            category_name = (
+                folder_name
+                if area_type == "folder"
+                else CAMERA_CATEGORY_NAMES.get(category, category)
+            )
+            for camera in area_resp:
+                entity = _make_video_camera_entity(
+                    config_entry,
+                    api,
+                    proxy,
+                    proxy_secret,
+                    camera,
+                    category,
+                    category_name,
+                )
+                if entity is None or entity.unique_id in seen_unique_ids:
+                    continue
+
+                seen_unique_ids.add(entity.unique_id)
+                entities.append(entity)
+
+    # If any area provides cameraIds not yet loaded, load them individually:
+    extra_camera_ids: list[tuple[str, str, str]] = []
+    for area in response:
+        if isinstance(area, dict):
+            c_ids = area.get("cameraIds")
+            if isinstance(c_ids, list):
+                f_name = area.get("folderName")
+                cat = area.get("category") or "None"
+                cat_name = f_name or CAMERA_CATEGORY_NAMES.get(cat, cat)
+                for cid in c_ids:
+                    if (
+                        isinstance(cid, str)
+                        and f"video_camera_{cid}" not in seen_unique_ids
+                    ):
+                        extra_camera_ids.append((cid, cat, cat_name))
+
+    if extra_camera_ids:
+        extra_resps = await asyncio.gather(
+            *(api.get_user_video_camera(cid) for cid, _, _ in extra_camera_ids),
+            return_exceptions=True,
+        )
+        for (cid, cat, cat_name), cam_resp in zip(extra_camera_ids, extra_resps):
+            if isinstance(cam_resp, dict) and "error" not in cam_resp:
+                entity = _make_video_camera_entity(
+                    config_entry,
+                    api,
+                    proxy,
+                    proxy_secret,
+                    cam_resp,
+                    cat,
+                    cat_name,
+                )
+                if entity is not None and entity.unique_id not in seen_unique_ids:
+                    seen_unique_ids.add(entity.unique_id)
+                    entities.append(entity)
 
     return entities
 
@@ -316,6 +420,7 @@ class IntercomCamera(Camera):
         self._stream_url = stream_url
         self._snapshot_url = snapshot_url
         self._key_data = key_data
+        self._source_id = key_data.get("sourceId")
         self._proxy = proxy
         self._proxy_secret = proxy_secret
         self._proxy_stream_path: str | None = None
@@ -325,8 +430,19 @@ class IntercomCamera(Camera):
         self._device_model = device_model
 
     @property
+    def source_id(self) -> str | None:
+        return self._source_id
+
+    async def async_get_video_archive(self) -> dict[str, Any] | None:
+        if not self._source_id:
+            return None
+        return await self._api.get_video_archive(self._source_id)
+
+    @property
     def extra_state_attributes(self):
         attributes = dict(self._key_data)
+        if self._source_id and "source_id" not in attributes:
+            attributes["source_id"] = self._source_id
         if self._proxy_stream_path:
             attributes["go2rtc_webrtc_path"] = self._proxy_stream_path
         if self._proxy_stream_url:
@@ -563,7 +679,9 @@ def _parse_offer_sdp(offer_sdp: str) -> WHEPOfferData:
 
 def _whep_url_from_webrtc_url(webrtc_url: str) -> str:
     parsed = urlsplit(webrtc_url)
-    path = parsed.path.rstrip("/") + "/whep"
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/whep"):
+        path = f"{path}/whep"
     return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
 
 
